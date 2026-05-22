@@ -128,8 +128,17 @@
   .days-grid {
     display: grid;
     grid-template-columns: repeat(7, 1fr);
-    gap: 5px;
+    gap: 4px;
   }
+  .dow-label {
+    text-align: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--tg-theme-hint-color, #999);
+    padding: 2px 0 4px;
+  }
+  .dow-label.weekend { color: #ff3b30; }
+  .day-spacer { /* пустая ячейка для сдвига */ }
   .day-btn {
     aspect-ratio: 1;
     border-radius: 9px;
@@ -145,9 +154,12 @@
     align-items: center;
     justify-content: center;
   }
+  .day-btn.weekend {
+    color: #ff3b30;
+  }
   .day-btn.selected {
     background: var(--tg-theme-button-color, #2481cc);
-    color: var(--tg-theme-button-text-color, #fff);
+    color: var(--tg-theme-button-text-color, #fff) !important;
     transform: scale(1.05);
   }
   .day-btn:active { transform: scale(0.94); }
@@ -350,19 +362,42 @@
     const monthIdx = MONTHS.indexOf(month);
     const year = new Date().getFullYear();
     const daysInMonth = new Date(year, monthIdx + 1, 0).getDate();
+    // День недели первого числа (0=вс..6=сб), переводим в пн=0..вс=6
+    const firstDow = (new Date(year, monthIdx, 1).getDay() + 6) % 7;
 
     selectedDays.clear();
     updateDaysCount();
 
     const grid = document.getElementById('daysGrid');
     grid.innerHTML = '';
+
+    // Заголовки дней недели
+    const dowNames = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+    dowNames.forEach((name, i) => {
+      const lbl = document.createElement('div');
+      lbl.className = 'dow-label' + (i >= 5 ? ' weekend' : '');
+      lbl.textContent = name;
+      grid.appendChild(lbl);
+    });
+
+    // Пустые ячейки до первого числа
+    for (let i = 0; i < firstDow; i++) {
+      const sp = document.createElement('div');
+      sp.className = 'day-spacer';
+      grid.appendChild(sp);
+    }
+
+    // Дни месяца
     for (let d = 1; d <= daysInMonth; d++) {
+      const dow = (firstDow + d - 1) % 7; // 0=пн..6=вс
       const btn = document.createElement('button');
-      btn.className = 'day-btn';
+      btn.className = 'day-btn' + (dow >= 5 ? ' weekend' : '');
       btn.textContent = d;
+      btn.dataset.day = d;
       btn.addEventListener('click', () => toggleDay(d, btn));
       grid.appendChild(btn);
     }
+
     document.getElementById('selectAllBtn').textContent = 'Выбрать все дни';
   }
 
@@ -386,7 +421,7 @@
     selectedDays.clear();
     btns.forEach(btn => {
       if (!allSelected) {
-        selectedDays.add(parseInt(btn.textContent));
+        selectedDays.add(parseInt(btn.dataset.day));
         btn.classList.add('selected');
       } else {
         btn.classList.remove('selected');
