@@ -90,7 +90,49 @@ app.post('/api/vacation', async (req, res) => {
   }
 });
 
-// Telegram Bot
+// POST /api/sync-drivers — браузер шлёт массив водителей, сервер пишет в Notion
+app.post('/api/sync-drivers', async (req, res) => {
+  const { drivers } = req.body;
+  if (!Array.isArray(drivers)) return res.status(400).json({ error: 'drivers must be array' });
+
+  const norm = p => p ? String(p).replace(/\D/g,'').replace(/^8/,'7') : '';
+
+  let existing = [], cursor;
+  do {
+    const body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    const r = await fetch(`https://api.notion.com/v1/databases/${DB_EMPLOYEES}/query`, {
+      method: 'POST', headers: NOTION_HEADERS, body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!d.results) return res.status(500).json({ error: 'Notion query failed', details: d });
+    existing = existing.concat(d.results);
+    cursor = d.has_more ? d.next_cursor : null;
+  } while (cursor);
+
+  const existPhones = new Set(existing.map(p => norm(p.properties['Телефон']?.phone_number)).filter(Boolean));
+  const existNames  = new Set(existing.map(p => p.properties['ФИО']?.title?.[0]?.plain_text?.trim()).filter(Boolean));
+
+  let added = 0, skipped = 0, errors = 0;
+  for (const u of drivers) {
+    const fio = [u.last_name, u.first_name, u.middle_name].filter(Boolean).join(' ');
+    const phone = norm(u.phone);
+    if ((phone && existPhones.has(phone)) || (!phone && existNames.has(fio))) { skipped++; continue; }
+    const props = { 'ФИО': { title: [{ text: { content: fio } }] } };
+    if (u.phone) props['Телефон'] = { phone_number: String(u.phone) };
+    const r = await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST', headers: NOTION_HEADERS,
+      body: JSON.stringify({ parent: { database_id: DB_EMPLOYEES }, properties: props }),
+    });
+    const d = await r.json();
+    if (d.id) { added++; console.log(`✅ added: ${fio}`); }
+    else { errors++; console.error(`❌ ${fio}:`, d.message); }
+    await new Promise(r => setTimeout(r, 320));
+  }
+  res.json({ success: true, added, skipped, errors, total: drivers.length });
+});
+
+// ─── Telegram Bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 const getKeyboard = () => APP_URL ? {
