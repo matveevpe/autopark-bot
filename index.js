@@ -3,7 +3,6 @@ const fetch = require('node-fetch');
 const TelegramBot = require('node-telegram-bot-api');
 const path = require('path');
 
-// ─── Конфигурация — всё задаётся через переменные окружения ──────────────────
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const DB_VACATIONS = process.env.DB_VACATIONS || '8195f2ccc73e418cae12d3639211da86';
@@ -16,7 +15,6 @@ if (!BOT_TOKEN || !NOTION_TOKEN) {
   process.exit(1);
 }
 
-// ─── Express ──────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -27,7 +25,23 @@ const NOTION_HEADERS = {
   'Content-Type': 'application/json',
 };
 
-// GET /api/employees — список водителей из Notion
+// DEBUG — посмотреть сырой ответ от Notion
+app.get('/debug/notion', async (req, res) => {
+  try {
+    const r = await fetch(`https://api.notion.com/v1/databases/${DB_EMPLOYEES}/query`, {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({ page_size: 3 }),
+    });
+    const text = await r.text();
+    res.set('Content-Type', 'application/json');
+    res.send(text);
+  } catch (err) {
+    res.json({ fetch_error: err.message });
+  }
+});
+
+// GET /api/employees
 app.get('/api/employees', async (req, res) => {
   try {
     const r = await fetch(`https://api.notion.com/v1/databases/${DB_EMPLOYEES}/query`, {
@@ -39,6 +53,7 @@ app.get('/api/employees', async (req, res) => {
       }),
     });
     const data = await r.json();
+    console.log('Notion employees status:', r.status, data.object, data.message || '');
     if (!data.results) return res.status(500).json({ error: 'Notion error', details: data });
 
     const employees = data.results
@@ -53,7 +68,7 @@ app.get('/api/employees', async (req, res) => {
   }
 });
 
-// POST /api/vacation — создать запись в Notion
+// POST /api/vacation
 app.post('/api/vacation', async (req, res) => {
   const { employee, month, type, days } = req.body;
   if (!employee || !month || !type || !days)
@@ -74,6 +89,7 @@ app.post('/api/vacation', async (req, res) => {
       }),
     });
     const data = await r.json();
+    console.log('Notion vacation status:', r.status, data.object, data.message || '');
     if (data.id) res.json({ success: true, id: data.id });
     else res.status(400).json({ error: data.message || 'Ошибка Notion' });
   } catch (err) {
@@ -82,7 +98,7 @@ app.post('/api/vacation', async (req, res) => {
   }
 });
 
-// ─── Telegram Bot ─────────────────────────────────────────────────────────────
+// Telegram Bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 const getKeyboard = () => APP_URL ? {
@@ -121,7 +137,6 @@ async function setMenuButton() {
   }
 }
 
-// ─── Запуск ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 Server on port ${PORT}`);
   setMenuButton();
