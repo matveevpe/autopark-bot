@@ -25,21 +25,6 @@ const NOTION_HEADERS = {
   'Content-Type': 'application/json',
 };
 
-// DEBUG — посмотреть сырой ответ от Notion
-app.get('/debug/notion', async (req, res) => {
-  try {
-    const r = await fetch(`https://api.notion.com/v1/databases/${DB_EMPLOYEES}/query`, {
-      method: 'POST',
-      headers: NOTION_HEADERS,
-      body: JSON.stringify({ page_size: 3 }),
-    });
-    const text = await r.text();
-    res.set('Content-Type', 'application/json');
-    res.send(text);
-  } catch (err) {
-    res.json({ fetch_error: err.message });
-  }
-});
 
 // GET /api/employees
 app.get('/api/employees', async (req, res) => {
