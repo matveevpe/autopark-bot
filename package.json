@@ -1,0 +1,14 @@
+{
+  "name": "autopark-bot",
+  "version": "1.0.0",
+  "description": "Telegram Mini App для управления отпусками водителей",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
