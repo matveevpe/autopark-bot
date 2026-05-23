@@ -562,22 +562,28 @@ if (APP_URL) {
 // ─── КНОПКА МЕНЮ ─────────────────────────────────────────────────────────────
 
 if (APP_URL) {
-  bot.setChatMenuButton({
-    menu_button: {
-      type: "web_app",
-      text: "📅 Выходные",
-      web_app: { url: APP_URL },
-    },
-  }).then(() => console.log("✅ Menu button set"))
-    .catch(() => {});
+  // setChatMenuButton не поддерживается в node-telegram-bot-api@0.66
+  // Вызываем Telegram API напрямую через node-fetch
+  const fetch = require("node-fetch");
+  fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setChatMenuButton`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      menu_button: { type: "web_app", text: "📅 Выходные", web_app: { url: APP_URL } }
+    })
+  })
+  .then(r => r.json())
+  .then(r => console.log("✅ Menu button set:", r.ok))
+  .catch(e => console.error("Menu button error:", e.message));
 }
 
 // ─── ЕЖЕДНЕВНЫЕ УВЕДОМЛЕНИЯ (09:00 МСК) ──────────────────────────────────────
 
+// Каждый день в 09:00 МСК = 06:00 UTC
 cron.schedule("0 6 * * *", async () => {
   console.log("🔔 Проверяю дедлайны...");
   await checkDeadlines();
-}, { timezone: "Europe/Moscow" });
+});
 
 async function checkDeadlines() {
   const today    = new Date();
