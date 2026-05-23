@@ -339,21 +339,33 @@
   const currentMonth = MONTHS[new Date().getMonth()];
   document.getElementById('month').value = currentMonth;
 
-  // Загрузить список водителей
-  fetch('/api/employees')
-    .then(r => r.json())
+  // Telegram ID для авторизации
+  const tg = window.Telegram?.WebApp;
+  let tgUserId = tg?.initDataUnsafe?.user?.id || '';
+
+  // Загрузить список водителей (только для менеджеров)
+  fetch('/api/employees?tgId=' + tgUserId)
+    .then(r => {
+      if (r.status === 403) {
+        document.getElementById('app').style.display = 'none';
+        document.getElementById('accessDenied').style.display = 'block';
+        throw new Error('no access');
+      }
+      return r.json();
+    })
     .then(({ employees }) => {
       const sel = document.getElementById('employee');
       if (!employees?.length) {
-        sel.innerHTML = '<option>Ошибка загрузки</option>';
+        sel.innerHTML = '<option>Список пуст</option>';
         return;
       }
       sel.innerHTML = employees.map(e =>
         `<option value="${e}">${e}</option>`
       ).join('');
     })
-    .catch(() => {
-      document.getElementById('employee').innerHTML = '<option>Ошибка соединения</option>';
+    .catch(e => {
+      if (e.message !== 'no access')
+        document.getElementById('employee').innerHTML = '<option>Ошибка соединения</option>';
     });
 
   // Построить сетку дней
@@ -474,7 +486,7 @@
       const res = await fetch('/api/vacation', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ employee, month, type: selectedType, days }),
+        body: JSON.stringify({ employee, month, type: selectedType, days, tgId: tgUserId }),
       });
       const data = await res.json();
 
@@ -508,5 +520,14 @@
   // Инит
   buildDaysGrid();
 </script>
+
+  <!-- Экран: нет доступа -->
+  <div id="accessDenied" style="display:none; padding:40px 20px; text-align:center;">
+    <div style="font-size:48px; margin-bottom:16px;">🔒</div>
+    <div style="font-size:18px; font-weight:700; margin-bottom:8px;">Нет доступа</div>
+    <div style="color:var(--tg-theme-hint-color,#999); font-size:14px; line-height:1.5;">
+      Приложение доступно только для менеджеров и администраторов.
+    </div>
+  </div>
 </body>
 </html>
