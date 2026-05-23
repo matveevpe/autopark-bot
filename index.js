@@ -1076,4 +1076,144 @@ if (APP_URL) {
   }).then(r=>r.json()).then(r=>console.log("✅ Menu:", r.ok)).catch(()=>{});
 }
 
+
+// ─── API ДЛЯ МИНИ-ПРИЛОЖЕНИЯ ──────────────────────────────────────────────────
+
+// Проверка: является ли пользователь администратором/менеджером
+async function isAdmin(tgId) {
+  if (!tgId) return false;
+  if (ADMIN_IDS.includes(String(tgId))) return true;
+  try {
+    const pages = await qry(DB.staff, { and: [
+      { property: "Telegram ID", rich_text: { equals: String(tgId) } },
+      { property: "Статус", select: { equals: "Активен" } },
+    ]});
+    if (!pages.length) return false;
+    const role = gSel(pages[0], "Роль");
+    return ["Администратор","Менеджер"].includes(role);
+  } catch { return false; }
+}
+
+// GET /api/employees — список водителей
+app.get("/api/employees", async (req, res) => {
+  const tgId = req.query.tgId;
+  if (!await isAdmin(tgId)) {
+    return res.status(403).json({ error: "Доступ только для администраторов" });
+  }
+  try {
+    const pages = await qry(DB.drivers);
+    const employees = pages
+      .filter(p => gTtl(p,"ФИО") && gSel(p,"Статус") === "Работает")
+      .map(p => ({
+        id:    p.id,
+        name:  gTtl(p,"ФИО"),
+        car:   gTxt(p,"Гос. номер авто"),
+        phone: gPh(p,"Телефон"),
+      }))
+      .sort((a,b) => a.name.localeCompare(b.name,"ru"));
+    res.json({ employees });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/vacation — создать запись об отпуске/выходном
+app.post("/api/vacation", async (req, res) => {
+  const { tgId, employee, month, type, days, dateStart, dateEnd } = req.body;
+  if (!await isAdmin(tgId)) {
+    return res.status(403).json({ error: "Доступ только для администраторов" });
+  }
+  try {
+    const absId = await nextId("ABS", DB.absences);
+    const props = {
+      "Сотрудник": ttl(employee || ""),
+      "Месяц":     sel(month || ""),
+      "Тип":       sel(type  || "Выходной"),
+      "Дни":       rt(String(days || "")),
+      "ID записи": rt(absId),
+      "Статус":    sel("Согласован"),
+    };
+    if (dateStart) props["Дата начала"]    = { date: { start: dateStart } };
+    if (dateEnd)   props["Дата окончания"] = { date: { start: dateEnd   } };
+
+    await crt(DB.absences, props);
+    res.json({ success: true, id: absId });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ─── API ДЛЯ МИНИ-ПРИЛОЖЕНИЯ «ВЫХОДНЫЕ» ─────────────────────────────────────
+
+// Проверка: является ли tgId администратором или менеджером
+async function isManagerOrAdmin(tgId) {
+  if (!tgId) return false;
+  if (ADMIN_IDS.includes(String(tgId))) return true;
+  try {
+    const pages = await qry(DB.staff, { and: [
+      { property: "Telegram ID", rich_text: { equals: String(tgId) } },
+      { property: "Статус", select: { equals: "Активен" } },
+    ]});
+    if (!pages.length) return false;
+    const role = gSel(pages[0], "Роль");
+    return ["Менеджер", "Администратор"].includes(role);
+  } catch { return false; }
+}
+
+// Список водителей — только для менеджеров/админов
+app.get("/api/employees", async (req, res) => {
+  const tgId = req.query.tgId;
+  if (!(await isManagerOrAdmin(tgId))) {
+    return res.status(403).json({ error: "Нет доступа. Только для менеджеров." });
+  }
+  try {
+    const pages = await qry(DB.drivers, {
+      property: "Статус", select: { equals: "Работает" }
+    });
+    const list = pages
+      .map(p => gTtl(p, "ФИО"))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b, "ru"));
+    res.json({ employees: list });
+  } catch (e) {
+    res.status(500).json({ employees: [], error: e.message });
+  }
+});
+
+// Добавить запись об отпуске/выходном — только для менеджеров/админов
+app.post("/api/vacation", async (req, res) => {
+  const { employee, month, type, days, tgId } = req.body;
+  if (!(await isManagerOrAdmin(tgId))) {
+    return res.status(403).json({ success: false, error: "Нет доступа." });
+  }
+  if (!employee || !month || !days) {
+    return res.status(400).json({ success: false, error: "Не все поля заполнены" });
+  }
+  try {
+    await crt(DB.absences, {
+      "Сотрудник": ttl(employee),
+      "Месяц":     sel(month),
+      "Тип":       sel(type || "Выходной"),
+      "Дни":       rt(days),
+    });
+
+    // Уведомляем менеджеров
+    const user = employee;
+    const managerIds = await getManagerIds();
+    for (const a of managerIds) {
+      bot.sendMessage(a,
+        `📅 <b>Выходные добавлены</b>
+👤 ${user}
+📅 ${month} — ${type}
+Дни: ${days}`,
+        { parse_mode: "HTML" }).catch(() => {});
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
