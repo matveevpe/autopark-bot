@@ -1,6 +1,7 @@
 /**
- * Автопарк CRM — Telegram-бот v2
- * Полный цикл ремонта через inline-кнопки без Notion
+ * Автопарк CRM — Telegram-бот v3
+ * Роли: Водитель / Менеджер / Механик / Администратор
+ * Полный цикл ремонта с разводкой уведомлений и логикой оплаты
  */
 
 const TelegramBot = require("node-telegram-bot-api");
@@ -15,24 +16,33 @@ const BOT_TOKEN    = process.env.BOT_TOKEN;
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const APP_URL      = process.env.APP_URL || "";
 const PORT         = process.env.PORT || 8080;
+// Супер-администраторы — получают все уведомления
 const ADMIN_IDS    = (process.env.ADMIN_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
 
 const DB = {
-  cars:          "a52b75e6a94b4e29a7675b0c485a51b7",
-  drivers:       "3e4caec4095c45b49eabd35652a00ea0",
-  absences:      "8195f2ccc73e418cae12d3639211da86",
-  repairs:       "673701b3aff148b683bb57386786fa80",
-  maintenance:   "f449297c646a47928bfc69dada31f071",
-  insurances:    "44d9220f9f0c458587f8eb9db711a506",
-  inspections:   "cb4026fb6d424cbe894f1ce91f75e772",
-  notifications: "695a2be424e74c0a96d7a72749fbc21d",
+  cars:         "a52b75e6a94b4e29a7675b0c485a51b7",
+  drivers:      "3e4caec4095c45b49eabd35652a00ea0",
+  staff:        "66174d5ed4c240788eae47f2ef533e23", // 👔 Сотрудники
+  stos:         "09353d23ecb64c4a96fea71594307afe", // 🏪 Сервисные центры
+  repairs:      "673701b3aff148b683bb57386786fa80",
+  absences:     "8195f2ccc73e418cae12d3639211da86",
+  insurances:   "44d9220f9f0c458587f8eb9db711a506",
+  inspections:  "cb4026fb6d424cbe894f1ce91f75e772",
 };
 
-const NOTION_URL = "https://www.notion.so";
+// Типы ремонта → кто платит по умолчанию
+const PAY_DEFAULT = {
+  "Двигатель":       "Парк",
+  "Плановый":        "Парк",
+  "Диагностика":     "Парк",
+  "Шиномонтаж":      "Водитель",
+  "Стекло":          "Водитель",
+  "Аварийный":       "Водитель",
+  "Кузовной":        "Водитель",
+};
 
 if (!BOT_TOKEN || !NOTION_TOKEN) {
-  console.error("❌ Задай BOT_TOKEN и NOTION_TOKEN в переменных окружения!");
-  process.exit(1);
+  console.error("❌ Задай BOT_TOKEN и NOTION_TOKEN!"); process.exit(1);
 }
 
 // ─── ИНИЦИАЛИЗАЦИЯ ────────────────────────────────────────────────────────────
@@ -42,230 +52,167 @@ const app    = express();
 app.use(express.json());
 app.use(express.static("public"));
 
-const bot = APP_URL
-  ? new TelegramBot(BOT_TOKEN)
-  : new TelegramBot(BOT_TOKEN, { polling: true });
-
-const userCache = new Map();   // tgId → user
-const sessions  = new Map();   // tgId → { state, data }
+const bot      = APP_URL ? new TelegramBot(BOT_TOKEN) : new TelegramBot(BOT_TOKEN, { polling: true });
+const cache    = new Map();   // tgId → user object
+const sessions = new Map();   // tgId → { state, data }
 
 // ─── NOTION ХЕЛПЕРЫ ───────────────────────────────────────────────────────────
 
-const getText  = (p, k) => { try { return p.properties[k].rich_text[0].plain_text; } catch { return ""; } };
-const getTitle = (p, k) => { try { return p.properties[k].title[0].plain_text; }    catch { return ""; } };
-const getSel   = (p, k) => { try { return p.properties[k].select?.name || ""; }     catch { return ""; } };
-const getPhone = (p, k) => { try { return (p.properties[k].phone_number||"").replace(/\D/g,""); } catch { return ""; } };
-const getDate  = (p, k) => { try { return p.properties[k].date?.start || ""; }      catch { return ""; } };
-const getNum   = (p, k) => { try { return p.properties[k].number ?? null; }         catch { return null; } };
+const gTxt  = (p,k) => { try { return p.properties[k].rich_text[0].plain_text; }     catch { return ""; }};
+const gTtl  = (p,k) => { try { return p.properties[k].title[0].plain_text; }         catch { return ""; }};
+const gSel  = (p,k) => { try { return p.properties[k].select?.name  || ""; }         catch { return ""; }};
+const gPh   = (p,k) => { try { return (p.properties[k].phone_number||"").replace(/\D/g,""); } catch { return ""; }};
+const gNum  = (p,k) => { try { return p.properties[k].number ?? null; }              catch { return null; }};
+const gDate = (p,k) => { try { return p.properties[k].date?.start   || ""; }         catch { return ""; }};
+const gChk  = (p,k) => { try { return p.properties[k].checkbox      || false; }      catch { return false; }};
+const norm  = s  => (s||"").replace(/\D/g,"").replace(/^8/,"7");
 
-const norm = s => (s||"").replace(/\D/g,"").replace(/^8/,"7");
+const rt  = v => ({ rich_text: [{ text: { content: String(v||"").slice(0,2000) } }] });
+const ttl = v => ({ title:     [{ text: { content: String(v||"").slice(0,2000) } }] });
+const sel = v => v ? { select: { name: v } } : { select: null };
+const num = v => ({ number: v != null ? parseFloat(v) : null });
 
-async function notionQuery(dbId, filter) {
-  const pages = []; let cursor;
+async function qry(dbId, filter) {
+  const pages = []; let c;
   while (true) {
-    const r = await notion.databases.query({ database_id: dbId, filter, start_cursor: cursor, page_size: 100 });
+    const r = await notion.databases.query({ database_id: dbId, filter, start_cursor: c, page_size: 100 });
     pages.push(...r.results);
     if (!r.has_more) break;
-    cursor = r.next_cursor;
+    c = r.next_cursor;
   }
   return pages;
 }
 
-async function notionUpdate(pageId, props) {
-  return notion.pages.update({ page_id: pageId, properties: props });
-}
+async function upd(id, props)   { return notion.pages.update({ page_id: id, properties: props }); }
+async function crt(db, props)   { return notion.pages.create({ parent: { database_id: db }, properties: props }); }
+async function get(id)          { return notion.pages.retrieve({ page_id: id }); }
 
-async function notionCreate(dbId, props) {
-  return notion.pages.create({ parent: { database_id: dbId }, properties: props });
-}
-
-function rt(v)  { return { rich_text: [{ text: { content: String(v||"").slice(0,2000) } }] }; }
-function ttl(v) { return { title:     [{ text: { content: String(v||"").slice(0,2000) } }] }; }
-function sel(v) { return v ? { select: { name: v } } : { select: null }; }
-function num(v) { return { number: v != null ? parseFloat(v) : null }; }
-
-async function nextId(prefix, dbId) {
-  const pages = await notionQuery(dbId);
-  const titleProp = pages[0] ? Object.keys(pages[0].properties).find(k => pages[0].properties[k].type === "title") : null;
-  const nums = pages.map(p => {
-    const t = titleProp ? getTitle(p, titleProp) : "";
-    const m = t.match(new RegExp(`^${prefix}-(\\d+)$`));
-    return m ? parseInt(m[1]) : 0;
-  }).filter(n => n > 0);
-  return `${prefix}-${String(Math.max(0, ...nums) + 1).padStart(3, "0")}`;
+async function nextId(pfx, db) {
+  const pages = await qry(db);
+  const key   = pages[0] ? Object.keys(pages[0].properties).find(k => pages[0].properties[k].type === "title") : null;
+  const nums  = pages.map(p => { const m = (key ? gTtl(p,key) : "").match(new RegExp(`^${pfx}-(\\d+)$`)); return m ? +m[1] : 0; }).filter(n=>n>0);
+  return `${pfx}-${String(Math.max(0,...nums)+1).padStart(3,"0")}`;
 }
 
 // ─── ИДЕНТИФИКАЦИЯ ────────────────────────────────────────────────────────────
 
+// Объект пользователя содержит: tgId, role, fio, phone, pageId, car (водитель), sto (механик)
 async function getUser(tgId) {
-  if (userCache.has(tgId)) return userCache.get(tgId);
-  const pages = await notionQuery(DB.drivers, { property: "Telegram ID", rich_text: { equals: String(tgId) } });
-  if (!pages.length) return null;
-  return cacheUser(pages[0], tgId);
+  if (cache.has(tgId)) return cache.get(tgId);
+  return await lookupByTgId(tgId);
+}
+
+async function lookupByTgId(tgId) {
+  // Ищем сначала в Сотрудниках
+  const staffPages = await qry(DB.staff, { property: "Telegram ID", rich_text: { equals: String(tgId) } });
+  if (staffPages.length) return buildStaffUser(staffPages[0], tgId);
+
+  // Потом в Водителях
+  const drvPages = await qry(DB.drivers, { property: "Telegram ID", rich_text: { equals: String(tgId) } });
+  if (drvPages.length) return buildDriverUser(drvPages[0], tgId);
+
+  return null;
 }
 
 async function findByPhone(phone) {
-  const all = await notionQuery(DB.drivers);
-  return all.find(p => norm(getPhone(p, "Телефон")) === norm(phone)) || null;
+  const n = norm(phone);
+  // Проверяем оба справочника
+  const staffAll = await qry(DB.staff);
+  const staffPage = staffAll.find(p => norm(gPh(p,"Телефон")) === n);
+  const drvAll  = await qry(DB.drivers);
+  const drvPage = drvAll.find(p => norm(gPh(p,"Телефон")) === n);
+  return { staffPage, drvPage };
 }
 
-function cacheUser(page, tgId) {
+function buildStaffUser(page, tgId) {
   const u = {
-    pageId: page.id,
-    fio:    getTitle(page, "ФИО"),
-    phone:  getPhone(page, "Телефон"),
-    car:    getText(page, "Гос. номер авто"),
-    status: getSel(page, "Статус"),
-    isAdmin: ADMIN_IDS.includes(String(tgId)),
     tgId,
+    pageId: page.id,
+    fio:    gTtl(page,"ФИО"),
+    phone:  gPh(page,"Телефон"),
+    role:   gSel(page,"Роль"),  // Менеджер / Механик / Администратор
+    sto:    gTxt(page,"СТО"),
+    isAdmin: ADMIN_IDS.includes(String(tgId)) || gSel(page,"Роль") === "Администратор",
+    db:     "staff",
   };
-  userCache.set(tgId, u);
+  cache.set(tgId, u);
   return u;
 }
 
-async function linkTg(pageId, tgId, username) {
-  await notionUpdate(pageId, {
-    "Telegram ID":       rt(tgId),
-    "Telegram username": rt(username || ""),
-  });
+function buildDriverUser(page, tgId) {
+  const u = {
+    tgId,
+    pageId: page.id,
+    fio:    gTtl(page,"ФИО"),
+    phone:  gPh(page,"Телефон"),
+    car:    gTxt(page,"Гос. номер авто"),
+    status: gSel(page,"Статус"),
+    role:   "Водитель",
+    isAdmin: ADMIN_IDS.includes(String(tgId)),
+    db:     "driver",
+  };
+  cache.set(tgId, u);
+  return u;
+}
+
+async function linkTg(db, pageId, tgId, username) {
+  await upd(pageId, { "Telegram ID": rt(tgId), "Telegram username": rt(username||"") });
 }
 
 // ─── КЛАВИАТУРЫ ───────────────────────────────────────────────────────────────
 
-const driverKb = {
-  reply_markup: { keyboard: [
-    [{ text: "🛠 Заявка на ремонт" }, { text: "🏖 Отпуск / Больничный" }],
-    [{ text: "📊 Мой статус" },       { text: "📋 Мои заявки" }],
-  ], resize_keyboard: true }
-};
+const kbDriver = { reply_markup: { keyboard: [
+  [{ text: "🛠 Заявка на ремонт" }, { text: "🏖 Отпуск / Больничный" }],
+  [{ text: "📊 Мой статус" },       { text: "📋 Мои заявки" }],
+], resize_keyboard: true }};
 
-const adminKb = {
-  reply_markup: { keyboard: [
-    [{ text: "🔧 Активные ремонты" }, { text: "📊 Статистика парка" }],
-    [{ text: "👥 Найти водителя" },    { text: "📣 Рассылка" }],
-    [{ text: "📋 Все заявки" },        { text: "🔔 Проверить сроки" }],
-  ], resize_keyboard: true }
-};
+const kbManager = { reply_markup: { keyboard: [
+  [{ text: "🔧 Активные ремонты" }, { text: "📊 Статистика парка" }],
+  [{ text: "👥 Найти водителя" },    { text: "📣 Рассылка" }],
+  [{ text: "🏪 Сервисные центры" }, { text: "🔔 Проверить сроки" }],
+], resize_keyboard: true }};
 
-const sharePhoneKb = {
-  reply_markup: { keyboard: [[{ text: "📱 Поделиться номером телефона", request_contact: true }]],
-    resize_keyboard: true, one_time_keyboard: true }
-};
+const kbMechanic = { reply_markup: { keyboard: [
+  [{ text: "🔧 Мои ремонты" },      { text: "📋 История ремонтов" }],
+  [{ text: "📊 Мой статус" }],
+], resize_keyboard: true }};
 
-const cancelKb = {
-  reply_markup: { keyboard: [[{ text: "❌ Отмена" }]], resize_keyboard: true, one_time_keyboard: true }
-};
+const kbPhone = { reply_markup: { keyboard: [[{ text: "📱 Поделиться номером", request_contact: true }]], resize_keyboard: true, one_time_keyboard: true }};
+const kbCancel = { reply_markup: { keyboard: [[{ text: "❌ Отмена" }]], resize_keyboard: true, one_time_keyboard: true }};
 
-function menuFor(user) { return user?.isAdmin ? adminKb : driverKb; }
-
-// ─── INLINE КНОПКИ РЕМОНТА ────────────────────────────────────────────────────
-
-// Статусы и их переходы
-const REPAIR_FLOW = {
-  "Заявка":     { label: "📋 Заявка",     next: null },
-  "Согласовано":{ label: "✅ Согласовано", next: "В работе" },
-  "В работе":   { label: "🔧 В работе",    next: "Готово" },
-  "Готово":     { label: "🎉 Готово",      next: "Оплачено" },
-  "Оплачено":   { label: "💰 Оплачено",    next: null },
-  "Отменено":   { label: "❌ Отменено",    next: null },
-};
-
-/** Inline-клавиатура для карточки ремонта (для сообщения администратору) */
-function repairAdminKb(pageId, status) {
-  const buttons = [];
-
-  if (status === "Заявка") {
-    buttons.push([
-      { text: "✅ Согласовать", callback_data: `rep_approve:${pageId}` },
-      { text: "❌ Отклонить",   callback_data: `rep_reject:${pageId}` },
-    ]);
-  }
-  if (status === "Согласовано") {
-    buttons.push([
-      { text: "🔧 Передать в работу", callback_data: `rep_work:${pageId}` },
-    ]);
-  }
-  if (status === "В работе") {
-    buttons.push([
-      { text: "✅ Отметить готовым",  callback_data: `rep_done:${pageId}` },
-      { text: "💰 Указать стоимость", callback_data: `rep_cost:${pageId}` },
-    ]);
-  }
-  if (status === "Готово") {
-    buttons.push([
-      { text: "💰 Оплачено",          callback_data: `rep_paid:${pageId}` },
-    ]);
-  }
-  if (!["Оплачено","Отменено","Готово"].includes(status)) {
-    buttons.push([
-      { text: "💬 Комментарий",       callback_data: `rep_comment:${pageId}` },
-    ]);
-  }
-
-  return { inline_keyboard: buttons };
-}
-
-/** Текст карточки ремонта */
-function repairText(r, verbose = true) {
-  const status   = r.status || getSel(r.page, "Статус");
-  const id       = r.id;
-  const car      = r.car;
-  const driver   = r.driver;
-  const type     = r.type;
-  const desc     = r.desc;
-  const sto      = r.sto;
-  const cost     = r.cost;
-  const comment  = r.comment;
-
-  let text = `🔧 <b>Ремонт ${id}</b>  ${REPAIR_FLOW[status]?.label || status}\n\n`;
-  text += `🚗 Авто: <b>${car}</b>\n`;
-  text += `👤 Водитель: ${driver}\n`;
-  text += `🔩 Тип: ${type}\n`;
-  if (verbose) text += `📝 ${desc}\n`;
-  if (sto)     text += `🏠 СТО: <b>${sto}</b>\n`;
-  if (cost)    text += `💰 Стоимость: <b>${cost} ₽</b>\n`;
-  if (comment) text += `💬 Комментарий: ${comment}\n`;
-  return text;
-}
-
-/** Прочитать данные ремонта из Notion-страницы */
-function parseRepair(page) {
-  return {
-    pageId:  page.id,
-    id:      getTitle(page, "ID заявки"),
-    car:     getText(page, "Гос. номер авто"),
-    driver:  getText(page, "ФИО водителя"),
-    driverTg:getText(page, "Telegram ID водителя"),
-    type:    getSel(page, "Тип ремонта"),
-    desc:    getText(page, "Описание поломки"),
-    status:  getSel(page, "Статус"),
-    sto:     getText(page, "Исполнитель / СТО"),
-    cost:    getNum(page, "Стоимость ремонта"),
-    comment: getText(page, "Комментарий механика"),
-  };
+function menuFor(user) {
+  if (!user) return kbPhone;
+  if (user.role === "Механик")     return kbMechanic;
+  if (user.role === "Менеджер" || user.role === "Администратор" || user.isAdmin) return kbManager;
+  return kbDriver;
 }
 
 // ─── /start ───────────────────────────────────────────────────────────────────
 
 bot.onText(/\/start/, async (msg) => {
   const tgId = msg.from.id;
-  userCache.delete(tgId);
+  cache.delete(tgId);
   const user = await getUser(tgId);
 
   if (user) {
-    const greeting = user.isAdmin
-      ? `👋 Привет, <b>${user.fio}</b>!\n\n<b>Режим администратора</b>`
-      : `👋 Привет, <b>${user.fio}</b>!\n🚗 Ваше авто: <b>${user.car || "не привязано"}</b>`;
-
-    await bot.sendMessage(tgId, greeting, { parse_mode: "HTML", ...menuFor(user) });
+    await greet(tgId, user);
     return;
   }
 
   sessions.set(tgId, { state: "waiting_phone" });
-  await bot.sendMessage(tgId,
-    `👋 Привет! Поделитесь номером телефона для входа в систему:`,
-    { parse_mode: "HTML", ...sharePhoneKb });
+  await bot.sendMessage(tgId, "👋 Привет! Поделитесь номером для входа в систему:", kbPhone);
 });
+
+async function greet(tgId, user) {
+  const roleEmoji = { Менеджер: "👔", Механик: "🔧", Администратор: "⚙️", Водитель: "🚗" };
+  const e = roleEmoji[user.role] || "👤";
+
+  let text = `👋 Привет, <b>${user.fio}</b>!\n${e} Роль: <b>${user.role}</b>`;
+  if (user.car) text += `\n🚗 Авто: <b>${user.car}</b>`;
+  if (user.sto) text += `\n🏪 СТО: <b>${user.sto}</b>`;
+
+  await bot.sendMessage(tgId, text, { parse_mode: "HTML", ...menuFor(user) });
+}
 
 // ─── РЕГИСТРАЦИЯ ──────────────────────────────────────────────────────────────
 
@@ -276,35 +223,153 @@ bot.on("contact", async (msg) => {
   const phone = norm(msg.contact.phone_number);
   await bot.sendMessage(tgId, "🔍 Ищу в базе...");
 
-  const page = await findByPhone(phone);
-  if (!page) {
+  const { staffPage, drvPage } = await findByPhone(phone);
+
+  if (!staffPage && !drvPage) {
     sessions.delete(tgId);
-    return bot.sendMessage(tgId, `❌ Номер ${phone} не найден. Обратитесь к администратору.`,
+    return bot.sendMessage(tgId, `❌ Номер не найден в системе. Обратитесь к администратору.`,
       { reply_markup: { remove_keyboard: true } });
   }
 
-  await linkTg(page.id, tgId, msg.from.username);
-  const user = cacheUser(page, tgId);
-  sessions.delete(tgId);
-
-  const greeting = user.isAdmin
-    ? `✅ Добро пожаловать, <b>${user.fio}</b>!\n\n<b>Режим администратора активен.</b>`
-    : `✅ Добро пожаловать, <b>${user.fio}</b>!\n🚗 Ваше авто: <b>${user.car || "не привязано"}</b>`;
-
-  await bot.sendMessage(tgId, greeting, { parse_mode: "HTML", ...menuFor(user) });
-
-  for (const a of ADMIN_IDS) {
-    bot.sendMessage(a, `👤 Зарегистрировался: <b>${user.fio}</b> (${phone})`, { parse_mode: "HTML" }).catch(() => {});
+  // Если есть и в Сотрудниках и в Водителях — спрашиваем роль
+  if (staffPage && drvPage) {
+    sessions.set(tgId, { state: "choose_role", data: { phone, staffPageId: staffPage.id, drvPageId: drvPage.id, username: msg.from.username } });
+    const staffRole = gSel(staffPage, "Роль");
+    return bot.sendMessage(tgId, "Вы совмещаете несколько ролей. Выберите как войти:",
+      { reply_markup: { keyboard: [
+        [{ text: `👔 ${staffRole}` }],
+        [{ text: "🚗 Водитель" }],
+      ], resize_keyboard: true, one_time_keyboard: true } });
   }
+
+  // Только один вариант
+  let user;
+  if (staffPage) {
+    await linkTg(DB.staff, staffPage.id, tgId, msg.from.username);
+    user = buildStaffUser(staffPage, tgId);
+  } else {
+    await linkTg(DB.drivers, drvPage.id, tgId, msg.from.username);
+    user = buildDriverUser(drvPage, tgId);
+  }
+
+  sessions.delete(tgId);
+  await greet(tgId, user);
+
+  for (const a of ADMIN_IDS)
+    bot.sendMessage(a, `👤 Вошёл: <b>${user.fio}</b> (${user.role})`, { parse_mode: "HTML" }).catch(()=>{});
 });
 
-// ─── ЗАЯВКА НА РЕМОНТ ─────────────────────────────────────────────────────────
+// ─── ВЫБОР РОЛИ ───────────────────────────────────────────────────────────────
+
+bot.on("message", async (msg) => {
+  const tgId    = msg.from.id;
+  const text    = msg.text || "";
+  const session = sessions.get(tgId);
+
+  if (text === "❌ Отмена") {
+    sessions.delete(tgId);
+    const u = await getUser(tgId);
+    return bot.sendMessage(tgId, "Действие отменено.", u ? menuFor(u) : { reply_markup: { remove_keyboard: true } });
+  }
+
+  if (!session) return handleMenu(msg);
+
+  // Выбор роли при совмещении
+  if (session.state === "choose_role") {
+    const { staffPageId, drvPageId, username } = session.data;
+    let user;
+
+    if (text.includes("Водитель")) {
+      const page = await get(drvPageId);
+      await linkTg(DB.drivers, drvPageId, tgId, username);
+      user = buildDriverUser(page, tgId);
+    } else {
+      const page = await get(staffPageId);
+      await linkTg(DB.staff, staffPageId, tgId, username);
+      user = buildStaffUser(page, tgId);
+    }
+
+    sessions.delete(tgId);
+    return greet(tgId, user);
+  }
+
+  await handleFSM(msg, session);
+});
+
+// ─── МЕНЮ ДЕЙСТВИЙ ────────────────────────────────────────────────────────────
+
+async function handleMenu(msg) {
+  const tgId = msg.from.id;
+  const text = msg.text || "";
+  const user = await getUser(tgId);
+
+  if (!user) {
+    sessions.set(tgId, { state: "waiting_phone" });
+    return bot.sendMessage(tgId, "Поделитесь номером для входа:", kbPhone);
+  }
+
+  // ── Водитель ────────────────────────────────────────────────────────────────
+  if (text === "🛠 Заявка на ремонт") return startRepair(tgId, user);
+  if (text === "📋 Мои заявки")       return showDriverRepairs(tgId, user);
+  if (text === "📊 Мой статус")       return showStatus(tgId, user);
+
+  // ── Менеджер / Администратор ─────────────────────────────────────────────────
+  if (text === "🔧 Активные ремонты") return showActiveRepairs(tgId);
+  if (text === "📊 Статистика парка") return showStats(tgId);
+  if (text === "👥 Найти водителя")   return startFindDriver(tgId);
+  if (text === "📣 Рассылка")         return startBroadcast(tgId, user);
+  if (text === "🏪 Сервисные центры") return showStos(tgId);
+  if (text === "🔔 Проверить сроки")  return checkDeadlines([tgId]);
+
+  // ── Механик ──────────────────────────────────────────────────────────────────
+  if (text === "🔧 Мои ремонты")      return showMechanicRepairs(tgId, user);
+  if (text === "📋 История ремонтов") return showMechanicHistory(tgId, user);
+}
+
+// ─── СТАТУС ПОЛЬЗОВАТЕЛЯ ──────────────────────────────────────────────────────
+
+async function showStatus(tgId, user) {
+  cache.delete(tgId);
+  const u = await getUser(tgId);
+  const lines = [
+    `📊 <b>Профиль</b>`,
+    `👤 ${u.fio}`,
+    `📱 ${u.phone}`,
+    `🎭 Роль: <b>${u.role}</b>`,
+  ];
+  if (u.car) lines.push(`🚗 Авто: <b>${u.car}</b>`);
+  if (u.sto) lines.push(`🏪 СТО: ${u.sto}`);
+  await bot.sendMessage(tgId, lines.join("\n"), { parse_mode: "HTML", ...menuFor(u) });
+}
+
+// ─── СЕРВИСНЫЕ ЦЕНТРЫ ─────────────────────────────────────────────────────────
+
+async function showStos(tgId) {
+  const pages = await qry(DB.stos);
+  if (!pages.length) return bot.sendMessage(tgId, "Список СТО пуст. Добавьте через Notion.", kbManager);
+
+  let text = "🏪 <b>Сервисные центры:</b>\n\n";
+  for (const p of pages) {
+    const name   = gTtl(p,"Название");
+    const addr   = gTxt(p,"Адрес");
+    const phone  = gPh(p,"Телефон");
+    const spec   = gSel(p,"Специализация");
+    const hours  = gTxt(p,"Рабочие часы");
+    const active = gChk(p,"Активен");
+    if (!active) continue;
+    text += `<b>${name}</b> (${spec})\n📍 ${addr}\n📞 ${phone || "—"}\n⏰ ${hours || "—"}\n\n`;
+  }
+  await bot.sendMessage(tgId, text, { parse_mode: "HTML", ...kbManager });
+}
+
+// ─── ЗАЯВКА НА РЕМОНТ (Водитель) ─────────────────────────────────────────────
 
 const REPAIR_TYPES = [
-  "🔧 Двигатель",    "⚙️ КПП / Трансмиссия",
-  "🛞 Шиномонтаж",   "💥 Кузов / Аварийный",
-  "🪟 Стекло",        "🔋 Электрика",
-  "🩺 Диагностика",  "❓ Другое",
+  ["🔧 Двигатель",   "⚙️ КПП / Трансмиссия"],
+  ["🛞 Шиномонтаж",  "💥 Кузов / Аварийный"],
+  ["🪟 Стекло",       "🔋 Электрика"],
+  ["🩺 Диагностика", "❓ Другое"],
+  ["❌ Отмена"],
 ];
 
 const TYPE_MAP = {
@@ -314,517 +379,687 @@ const TYPE_MAP = {
   "🩺 Диагностика":"Диагностика", "❓ Другое":"Плановый",
 };
 
-bot.onText(/^🛠 Заявка на ремонт$/, async (msg) => {
-  const tgId = msg.from.id;
-  const user = await getUser(tgId);
-  if (!user) return askPhone(tgId);
-  if (!user.car) return bot.sendMessage(tgId, "⚠️ К вашему аккаунту не привязано авто.\nОбратитесь к администратору.", { ...driverKb });
-
+async function startRepair(tgId, user) {
+  if (!user.car) return bot.sendMessage(tgId, "⚠️ К вашему аккаунту не привязано авто.\nОбратитесь к администратору.", kbDriver);
   sessions.set(tgId, { state: "rep_type", data: { car: user.car } });
-  await bot.sendMessage(tgId, `🛠 <b>Заявка на ремонт</b>\nАвто: <b>${user.car}</b>\n\nВыберите тип проблемы:`, {
-    parse_mode: "HTML",
-    reply_markup: { keyboard: [
-      REPAIR_TYPES.slice(0,2), REPAIR_TYPES.slice(2,4),
-      REPAIR_TYPES.slice(4,6), REPAIR_TYPES.slice(6,8),
-      [{ text: "❌ Отмена" }],
-    ], resize_keyboard: true }
-  });
-});
+  await bot.sendMessage(tgId, `🛠 <b>Заявка на ремонт</b>\n🚗 ${user.car}\n\nВыберите тип проблемы:`,
+    { parse_mode: "HTML", reply_markup: { keyboard: REPAIR_TYPES, resize_keyboard: true } });
+}
 
-// ─── МОИ ЗАЯВКИ (водитель) ────────────────────────────────────────────────────
+async function showDriverRepairs(tgId, user) {
+  const pages = await qry(DB.repairs, { property: "ФИО водителя", rich_text: { contains: user.fio } });
+  const active = pages.filter(p => !["Оплачено","Отменено"].includes(gSel(p,"Статус")));
+  if (!active.length) return bot.sendMessage(tgId, "✅ Нет активных заявок.", kbDriver);
 
-bot.onText(/^📋 Мои заявки$/, async (msg) => {
-  const tgId = msg.from.id;
-  const user = await getUser(tgId);
-  if (!user) return askPhone(tgId);
-
-  const pages = await notionQuery(DB.repairs, {
-    property: "ФИО водителя",
-    rich_text: { contains: user.fio }
-  });
-
-  const active = pages.filter(p => !["Оплачено","Отменено"].includes(getSel(p,"Статус")));
-  if (!active.length) return bot.sendMessage(tgId, "✅ У вас нет активных заявок.", driverKb);
-
-  await bot.sendMessage(tgId, `📋 <b>Ваши активные заявки:</b>`, { parse_mode: "HTML" });
   for (const p of active.slice(0,5)) {
     const r = parseRepair(p);
-    await bot.sendMessage(tgId, repairText(r), { parse_mode: "HTML" });
+    await bot.sendMessage(tgId, repairCard(r), { parse_mode: "HTML" });
   }
-});
+}
 
-// ─── АКТИВНЫЕ РЕМОНТЫ (админ) ─────────────────────────────────────────────────
+// ─── АКТИВНЫЕ РЕМОНТЫ (Менеджер) ─────────────────────────────────────────────
 
-bot.onText(/^🔧 Активные ремонты$/, async (msg) => {
-  const tgId = msg.from.id;
-  if (!ADMIN_IDS.includes(String(tgId))) return;
+async function showActiveRepairs(tgId) {
+  const pages = await qry(DB.repairs, { and: [
+    { property: "Статус", select: { does_not_equal: "Оплачено" } },
+    { property: "Статус", select: { does_not_equal: "Отменено" } },
+  ]});
 
-  const pages = await notionQuery(DB.repairs, {
-    and: [
-      { property: "Статус", select: { does_not_equal: "Оплачено" } },
-      { property: "Статус", select: { does_not_equal: "Отменено" } },
-    ]
-  });
-
-  if (!pages.length) return bot.sendMessage(tgId, "✅ Нет активных ремонтов.", adminKb);
-
-  await bot.sendMessage(tgId, `🔧 <b>Активных ремонтов: ${pages.length}</b>`, { parse_mode: "HTML" });
+  if (!pages.length) return bot.sendMessage(tgId, "✅ Нет активных ремонтов.", kbManager);
+  await bot.sendMessage(tgId, `🔧 <b>Активных: ${pages.length}</b>`, { parse_mode: "HTML" });
 
   for (const p of pages.slice(0,10)) {
     const r = parseRepair(p);
-    await bot.sendMessage(tgId, repairText(r), {
+    await bot.sendMessage(tgId, repairCard(r), {
       parse_mode: "HTML",
-      reply_markup: repairAdminKb(p.id, r.status),
+      reply_markup: managerRepairKb(p.id, r),
     });
   }
-});
+}
 
-// ─── СТАТИСТИКА (админ) ───────────────────────────────────────────────────────
+// ─── МОИ РЕМОНТЫ (Механик) ────────────────────────────────────────────────────
 
-bot.onText(/^📊 Статистика парка$/, async (msg) => {
-  const tgId = msg.from.id;
-  if (!ADMIN_IDS.includes(String(tgId))) return;
+async function showMechanicRepairs(tgId, user) {
+  const pages = await qry(DB.repairs, { and: [
+    { property: "Механик Telegram ID", rich_text: { equals: String(tgId) } },
+    { property: "Статус", select: { does_not_equal: "Оплачено" } },
+    { property: "Статус", select: { does_not_equal: "Отменено" } },
+  ]});
 
+  if (!pages.length) return bot.sendMessage(tgId, "✅ Нет назначенных ремонтов.", kbMechanic);
+
+  for (const p of pages.slice(0,10)) {
+    const r = parseRepair(p);
+    await bot.sendMessage(tgId, repairCard(r), {
+      parse_mode: "HTML",
+      reply_markup: mechanicRepairKb(p.id, r),
+    });
+  }
+}
+
+async function showMechanicHistory(tgId, user) {
+  const pages = await qry(DB.repairs, { and: [
+    { property: "Механик Telegram ID", rich_text: { equals: String(tgId) } },
+    { property: "Статус", select: { equals: "Готово" } },
+  ]});
+
+  if (!pages.length) return bot.sendMessage(tgId, "История ремонтов пуста.", kbMechanic);
+  await bot.sendMessage(tgId, `✅ Завершённых ремонтов: ${pages.length}`, kbMechanic);
+}
+
+// ─── СТАТИСТИКА (Менеджер) ────────────────────────────────────────────────────
+
+async function showStats(tgId) {
   await bot.sendMessage(tgId, "⏳ Считаю...");
-
   const [cars, drivers, repairs] = await Promise.all([
-    notionQuery(DB.cars),
-    notionQuery(DB.drivers),
-    notionQuery(DB.repairs),
+    qry(DB.cars), qry(DB.drivers), qry(DB.repairs)
   ]);
-
-  const byStatus = s => cars.filter(p => getSel(p,"Статус") === s).length;
-  const repActive = repairs.filter(p => !["Оплачено","Отменено"].includes(getSel(p,"Статус"))).length;
-  const working = drivers.filter(p => getSel(p,"Статус") === "Работает").length;
-  const vacation = drivers.filter(p => getSel(p,"Статус") === "В отпуске").length;
-
-  const text =
-    `📊 <b>Парк сегодня</b>\n\n` +
-    `🚗 <b>Автомобили:</b>\n` +
-    `  В аренде: ${byStatus("В аренде")}\n` +
-    `  Простой: ${byStatus("Простой")}\n` +
-    `  Ремонт: ${byStatus("Ремонт")}\n` +
-    `  На ТО: ${byStatus("На ТО")}\n\n` +
-    `👤 <b>Водители:</b>\n` +
-    `  Работают: ${working}\n` +
-    `  В отпуске: ${vacation}\n\n` +
-    `🔧 <b>Ремонты активных:</b> ${repActive}`;
-
-  await bot.sendMessage(tgId, text, { parse_mode: "HTML", ...adminKb });
-});
-
-// ─── ПРОВЕРИТЬ СРОКИ (админ) ──────────────────────────────────────────────────
-
-bot.onText(/^🔔 Проверить сроки$/, async (msg) => {
-  const tgId = msg.from.id;
-  if (!ADMIN_IDS.includes(String(tgId))) return;
-  await bot.sendMessage(tgId, "⏳ Проверяю...");
-  await checkDeadlines([tgId]);
-  await bot.sendMessage(tgId, "✅ Проверка завершена.", adminKb);
-});
-
-// ─── НАЙТИ ВОДИТЕЛЯ (админ) ───────────────────────────────────────────────────
-
-bot.onText(/^👥 Найти водителя$/, async (msg) => {
-  const tgId = msg.from.id;
-  if (!ADMIN_IDS.includes(String(tgId))) return;
-  sessions.set(tgId, { state: "find_driver" });
-  await bot.sendMessage(tgId, "Введите ФИО или номер телефона водителя:", cancelKb);
-});
-
-// ─── РАССЫЛКА (админ) ─────────────────────────────────────────────────────────
-
-bot.onText(/^📣 Рассылка$/, async (msg) => {
-  const tgId = msg.from.id;
-  if (!ADMIN_IDS.includes(String(tgId))) return;
-  sessions.set(tgId, { state: "broadcast" });
-  await bot.sendMessage(tgId,
-    "📣 <b>Рассылка всем водителям</b> со статусом «Работает»\n\nВведите текст сообщения:",
-    { parse_mode: "HTML", ...cancelKb });
-});
-
-// ─── МОЙ СТАТУС ───────────────────────────────────────────────────────────────
-
-bot.onText(/^📊 Мой статус$/, async (msg) => {
-  const tgId = msg.from.id;
-  userCache.delete(tgId);
-  const user = await getUser(tgId);
-  if (!user) return askPhone(tgId);
+  const cs = s => cars.filter(p => gSel(p,"Статус") === s).length;
+  const repA = repairs.filter(p => !["Оплачено","Отменено"].includes(gSel(p,"Статус"))).length;
+  const repW = repairs.filter(p => gSel(p,"Кто оплачивает") === "Водитель" && gSel(p,"Статус") === "Заявка").length;
 
   await bot.sendMessage(tgId,
-    `📊 <b>Ваш профиль</b>\n\n` +
-    `👤 ${user.fio}\n📱 ${user.phone}\n🚗 ${user.car || "авто не привязано"}\n📋 Статус: ${user.status}`,
-    { parse_mode: "HTML", ...menuFor(user) });
-});
+    `📊 <b>Парк</b>\n\n` +
+    `🚗 В аренде: ${cs("В аренде")} | Простой: ${cs("Простой")} | Ремонт: ${cs("Ремонт")}\n\n` +
+    `👤 Водителей: ${drivers.filter(p=>gSel(p,"Статус")==="Работает").length}\n\n` +
+    `🔧 Активных ремонтов: ${repA}\n` +
+    `💰 За счёт водителей (новые): ${repW}`,
+    { parse_mode: "HTML", ...kbManager });
+}
 
-// ─── CALLBACK (INLINE КНОПКИ) ─────────────────────────────────────────────────
+// ─── INLINE КНОПКИ ────────────────────────────────────────────────────────────
+
+// Кнопки менеджера для заявки
+function managerRepairKb(pageId, r) {
+  const btn = (text, action) => ({ text, callback_data: `${action}:${pageId}` });
+  const rows = [];
+
+  if (r.status === "Заявка") {
+    rows.push([btn("✅ Согласовать", "m_approve"), btn("❌ Отклонить", "m_reject")]);
+    rows.push([btn(`💰 Платит: ${r.payer || "?"}`, "m_toggle_payer")]);
+  }
+  if (r.status === "Согласовано") {
+    rows.push([btn("🔧 Назначить механика", "m_assign_mech")]);
+  }
+  if (r.status === "В работе") {
+    rows.push([btn("✅ Готово", "m_done"), btn("💰 Стоимость", "m_set_cost")]);
+  }
+  if (r.status === "Готово") {
+    rows.push([btn("💰 Оплачено", "m_paid")]);
+  }
+  if (!["Оплачено","Отменено"].includes(r.status)) {
+    rows.push([btn("💬 Комментарий", "m_comment")]);
+  }
+
+  return { inline_keyboard: rows };
+}
+
+// Кнопки механика
+function mechanicRepairKb(pageId, r) {
+  const btn = (text, action) => ({ text, callback_data: `${action}:${pageId}` });
+  const rows = [];
+
+  if (r.status === "Согласовано") {
+    rows.push([btn("▶️ Начать ремонт", "mech_start")]);
+  }
+  if (r.status === "В работе") {
+    rows.push([btn("✅ Завершить", "mech_done")]);
+    if (r.payer === "Водитель") {
+      rows.push([btn("💰 Выставить счёт водителю", "mech_send_bill")]);
+    }
+    rows.push([btn("📸 Прикрепить фото", "mech_photo")]);
+    rows.push([btn("💬 Комментарий", "mech_comment")]);
+  }
+
+  return { inline_keyboard: rows };
+}
+
+// Разобрать ремонт из страницы Notion
+function parseRepair(page) {
+  return {
+    pageId:      page.id,
+    id:          gTtl(page,"ID заявки"),
+    car:         gTxt(page,"Гос. номер авто"),
+    driver:      gTxt(page,"ФИО водителя"),
+    driverTg:    gTxt(page,"Telegram ID водителя"),
+    type:        gSel(page,"Тип ремонта"),
+    desc:        gTxt(page,"Описание поломки"),
+    status:      gSel(page,"Статус"),
+    payer:       gSel(page,"Кто оплачивает"),
+    mechFio:     gTxt(page,"Механик ФИО"),
+    mechTg:      gTxt(page,"Механик Telegram ID"),
+    sto:         gTxt(page,"Исполнитель / СТО"),
+    stoAddr:     gTxt(page,"Адрес СТО"),
+    cost:        gNum(page,"Стоимость ремонта"),
+    mechCost:    gNum(page,"Стоимость услуг механика"),
+    comment:     gTxt(page,"Комментарий механика"),
+    driverAgree: gSel(page,"Согласие водителя"),
+  };
+}
+
+// Карточка ремонта в тексте
+function repairCard(r) {
+  const statusIcon = { "Заявка":"📋","Согласовано":"✅","В работе":"🔧","Готово":"🎉","Отменено":"❌","Оплачено":"💰" };
+  const payIcon    = { "Парк":"🏢","Водитель":"👤","Страховка":"🛡","50/50":"⚖️" };
+
+  let t = `${statusIcon[r.status]||"?"} <b>${r.id}</b> — ${r.status}\n\n`;
+  t += `🚗 <b>${r.car}</b> | 👤 ${r.driver}\n`;
+  t += `🔩 ${r.type} | ${payIcon[r.payer]||"?"} Платит: <b>${r.payer||"—"}</b>\n`;
+  t += `📝 ${r.desc}\n`;
+  if (r.mechFio)  t += `🔧 Механик: ${r.mechFio}\n`;
+  if (r.sto)      t += `🏪 СТО: ${r.sto}\n`;
+  if (r.stoAddr)  t += `📍 ${r.stoAddr}\n`;
+  if (r.cost)     t += `💰 Стоимость: <b>${r.cost}₽</b>\n`;
+  if (r.mechCost) t += `🔧 Услуги механика: <b>${r.mechCost}₽</b>\n`;
+  if (r.comment)  t += `💬 ${r.comment}\n`;
+  return t;
+}
+
+// ─── CALLBACK QUERY ───────────────────────────────────────────────────────────
 
 bot.on("callback_query", async (q) => {
   const tgId = q.from.id;
-  const [action, pageId] = q.data.split(":");
-
-  // Отвечаем Telegram чтобы убрать "часики"
   await bot.answerCallbackQuery(q.id);
 
-  if (!ADMIN_IDS.includes(String(tgId))) {
-    return bot.answerCallbackQuery(q.id, { text: "Нет доступа", show_alert: true });
-  }
-
-  const page = await notion.pages.retrieve({ page_id: pageId });
+  const [action, pageId] = q.data.split(":");
+  const page = await get(pageId);
   const r    = parseRepair(page);
 
-  switch (action) {
+  // ── Менеджер ────────────────────────────────────────────────────────────────
 
-    // ── Согласовать ─────────────────────────────────────────────────────────
-    case "rep_approve": {
-      sessions.set(tgId, { state: "rep_approve_sto", data: { pageId, repair: r } });
-      await bot.sendMessage(tgId,
-        `✅ Согласуете <b>${r.id}</b>\n🚗 ${r.car}\n\nУкажите СТО и примерную стоимость:\n<i>Например: АвтоМастер, 3500р</i>`,
-        { parse_mode: "HTML", ...cancelKb });
-      break;
+  // Переключить кто платит
+  if (action === "m_toggle_payer") {
+    const cycle = ["Парк","Водитель","Страховка","50/50"];
+    const next  = cycle[(cycle.indexOf(r.payer)+1) % cycle.length];
+    await upd(pageId, { "Кто оплачивает": sel(next) });
+    r.payer = next;
+    return editMsg(q, repairCard(r), managerRepairKb(pageId, r));
+  }
+
+  // Согласовать → выбрать СТО
+  if (action === "m_approve") {
+    const stos = (await qry(DB.stos)).filter(p => gChk(p,"Активен"));
+    if (!stos.length) {
+      sessions.set(tgId, { state: "m_approve_sto_text", data: { pageId, repair: r } });
+      return bot.sendMessage(tgId, "Введите название и адрес СТО:", kbCancel);
+    }
+    sessions.set(tgId, { state: "m_approve_sto_select", data: { pageId, repair: r } });
+    const buttons = stos.map(p => [{ text: `🏪 ${gTtl(p,"Название")}`, callback_data: `sto_sel:${pageId}:${p.id}` }]);
+    buttons.push([{ text: "✏️ Ввести вручную", callback_data: `sto_manual:${pageId}` }]);
+    return bot.sendMessage(tgId, `Выберите СТО для <b>${r.id}</b>:`,
+      { parse_mode: "HTML", reply_markup: { inline_keyboard: buttons } });
+  }
+
+  // Выбор СТО из списка
+  if (action === "sto_sel") {
+    const [,repPageId, stoPageId] = q.data.split(":");
+    const repPage  = await get(repPageId);
+    const repR     = parseRepair(repPage);
+    const stoPage  = await get(stoPageId);
+    const stoName  = gTtl(stoPage,"Название");
+    const stoAddr  = gTxt(stoPage,"Адрес");
+    // Теперь выбираем механика
+    sessions.set(tgId, { state: "m_assign_mech_after_sto", data: { pageId: repPageId, repair: repR, sto: stoName, stoAddr } });
+    return chooseMechanic(tgId, repR);
+  }
+
+  // СТО вручную
+  if (action === "sto_manual") {
+    const repPage = await get(pageId);
+    sessions.set(tgId, { state: "m_approve_sto_text", data: { pageId, repair: parseRepair(repPage) } });
+    return bot.sendMessage(tgId, "Введите название СТО и адрес:\n<i>Например: АвтоМастер, ул. Ленина 15</i>",
+      { parse_mode: "HTML", ...kbCancel });
+  }
+
+  // Назначить механика (кнопка)
+  if (action === "m_assign_mech") {
+    sessions.set(tgId, { state: "m_assign_mech_after_sto", data: { pageId, repair: r, sto: r.sto, stoAddr: r.stoAddr } });
+    return chooseMechanic(tgId, r);
+  }
+
+  // Выбор механика из списка
+  if (action === "mech_sel") {
+    const parts = q.data.split(":");
+    const mechPageId = parts[2];
+    const repPageId  = parts[1];
+    const repPage    = await get(repPageId);
+    const repR       = parseRepair(repPage);
+    const sesData    = sessions.get(tgId)?.data || {};
+
+    const mechPage = await get(mechPageId);
+    const mechFio  = gTtl(mechPage,"ФИО");
+    const mechTgId = gTxt(mechPage,"Telegram ID");
+    const mechSto  = gTxt(mechPage,"СТО");
+
+    const sto     = sesData.sto || mechSto || repR.sto || "";
+    const stoAddr = sesData.stoAddr || repR.stoAddr || "";
+
+    await upd(repPageId, {
+      "Статус":              sel("Согласовано"),
+      "Механик ФИО":         rt(mechFio),
+      "Механик Telegram ID": rt(mechTgId),
+      "Исполнитель / СТО":   rt(sto),
+      "Адрес СТО":           rt(stoAddr),
+    });
+
+    sessions.delete(tgId);
+    repR.status  = "Согласовано";
+    repR.mechFio = mechFio;
+    repR.sto     = sto;
+    repR.stoAddr = stoAddr;
+
+    await bot.sendMessage(tgId, `✅ ${repR.id} согласован\n👷 Механик: ${mechFio}\n🏪 СТО: ${sto}`, kbManager);
+
+    // Уведомляем механика
+    if (mechTgId) {
+      const payNote = repR.payer === "Водитель" ? "\n💰 <b>Оплата за счёт водителя</b> — выставьте счёт после ремонта" : "\n🏢 Оплата за счёт парка";
+      bot.sendMessage(mechTgId,
+        `🔧 <b>Вам назначен ремонт ${repR.id}!</b>\n\n🚗 ${repR.car}\n📍 ${sto}${stoAddr ? ` — ${stoAddr}` : ""}\n🔩 ${repR.type}\n📝 ${repR.desc}${payNote}`,
+        { parse_mode: "HTML", reply_markup: mechanicRepairKb(repPageId, repR) }).catch(()=>{});
     }
 
-    // ── Отклонить ───────────────────────────────────────────────────────────
-    case "rep_reject": {
-      sessions.set(tgId, { state: "rep_reject_reason", data: { pageId, repair: r } });
-      await bot.sendMessage(tgId,
-        `❌ Отклоняете <b>${r.id}</b>\n\nУкажите причину отклонения:`,
-        { parse_mode: "HTML", ...cancelKb });
-      break;
-    }
+    // Уведомляем водителя
+    notifyDriver(repR, `✅ Заявка <b>${repR.id}</b> согласована!\n🏪 СТО: ${sto}\n${stoAddr ? `📍 ${stoAddr}` : ""}\n🔧 Механик: ${mechFio}`);
+    return;
+  }
 
-    // ── В работу ────────────────────────────────────────────────────────────
-    case "rep_work": {
-      await notionUpdate(pageId, {
-        "Статус": sel("В работе"),
-        "Дата начала ремонта": { date: { start: new Date().toISOString() } },
-      });
-      r.status = "В работе";
-      await editRepairMsg(q, r);
-      await notifyDriver(r, `🔧 Заявка <b>${r.id}</b> передана в работу.\nАвто: ${r.car}\nСТО: ${r.sto}`);
-      break;
-    }
+  // Отклонить
+  if (action === "m_reject") {
+    sessions.set(tgId, { state: "m_reject_reason", data: { pageId, repair: r } });
+    return bot.sendMessage(tgId, `Причина отклонения <b>${r.id}</b>:`, { parse_mode: "HTML", ...kbCancel });
+  }
 
-    // ── Готово ──────────────────────────────────────────────────────────────
-    case "rep_done": {
-      await notionUpdate(pageId, {
-        "Статус": sel("Готово"),
-        "Дата окончания ремонта": { date: { start: new Date().toISOString() } },
-      });
-      r.status = "Готово";
-      await editRepairMsg(q, r);
-      await notifyDriver(r,
-        `✅ <b>Ваш автомобиль готов!</b>\n🚗 ${r.car}\n${r.sto ? `Забирайте у: <b>${r.sto}</b>` : ""}`);
-      break;
-    }
+  // Готово (менеджер)
+  if (action === "m_done") {
+    await upd(pageId, { "Статус": sel("Готово"), "date:Дата окончания ремонта:start": new Date().toISOString(), "date:Дата окончания ремонта:is_datetime": 1 });
+    r.status = "Готово";
+    await editMsg(q, repairCard(r), managerRepairKb(pageId, r));
+    notifyDriver(r, `🎉 Ваш автомобиль готов!\n🚗 ${r.car}${r.stoAddr ? `\n📍 Забирайте: ${r.stoAddr}` : ""}`);
+    return;
+  }
 
-    // ── Оплачено ────────────────────────────────────────────────────────────
-    case "rep_paid": {
-      await notionUpdate(pageId, { "Статус": sel("Оплачено") });
-      r.status = "Оплачено";
-      await editRepairMsg(q, r);
-      break;
-    }
+  // Оплачено
+  if (action === "m_paid") {
+    await upd(pageId, { "Статус": sel("Оплачено") });
+    r.status = "Оплачено";
+    return editMsg(q, repairCard(r), { inline_keyboard: [] });
+  }
 
-    // ── Указать стоимость ───────────────────────────────────────────────────
-    case "rep_cost": {
-      sessions.set(tgId, { state: "rep_set_cost", data: { pageId, repair: r } });
-      await bot.sendMessage(tgId,
-        `💰 Стоимость ремонта <b>${r.id}</b>:\nВведите сумму в рублях:`,
-        { parse_mode: "HTML", ...cancelKb });
-      break;
-    }
+  // Указать стоимость
+  if (action === "m_set_cost") {
+    sessions.set(tgId, { state: "m_set_cost", data: { pageId, repair: r } });
+    return bot.sendMessage(tgId, `💰 Стоимость ремонта <b>${r.id}</b> (₽):`, { parse_mode: "HTML", ...kbCancel });
+  }
 
-    // ── Комментарий ─────────────────────────────────────────────────────────
-    case "rep_comment": {
-      sessions.set(tgId, { state: "rep_add_comment", data: { pageId, repair: r } });
-      await bot.sendMessage(tgId,
-        `💬 Комментарий к <b>${r.id}</b>:\nВведите текст:`,
-        { parse_mode: "HTML", ...cancelKb });
-      break;
+  // Комментарий менеджера
+  if (action === "m_comment") {
+    sessions.set(tgId, { state: "m_comment", data: { pageId, repair: r } });
+    return bot.sendMessage(tgId, `💬 Комментарий к <b>${r.id}</b>:`, { parse_mode: "HTML", ...kbCancel });
+  }
+
+  // ── Механик ─────────────────────────────────────────────────────────────────
+
+  // Начать ремонт
+  if (action === "mech_start") {
+    await upd(pageId, { "Статус": sel("В работе"), "date:Дата начала ремонта:start": new Date().toISOString(), "date:Дата начала ремонта:is_datetime": 1 });
+    r.status = "В работе";
+    await editMsg(q, repairCard(r), mechanicRepairKb(pageId, r));
+    notifyManagers(`🔧 Механик ${r.mechFio} начал ремонт <b>${r.id}</b>\n🚗 ${r.car}`);
+    notifyDriver(r, `🔧 Ремонт <b>${r.id}</b> начат.\nМеханик: ${r.mechFio}`);
+    return;
+  }
+
+  // Завершить ремонт (механик)
+  if (action === "mech_done") {
+    await upd(pageId, { "Статус": sel("Готово"), "date:Дата окончания ремонта:start": new Date().toISOString(), "date:Дата окончания ремонта:is_datetime": 1 });
+    r.status = "Готово";
+    await editMsg(q, repairCard(r), { inline_keyboard: [] });
+
+    // Если платит парк — просто уведомляем
+    if (r.payer !== "Водитель") {
+      notifyManagers(`✅ Механик ${r.mechFio} завершил <b>${r.id}</b>\n🚗 ${r.car}`);
+      notifyDriver(r, `🎉 Ваш автомобиль готов!\n🚗 ${r.car}\n📍 ${r.stoAddr || r.sto || ""}`);
     }
+    // Если платит водитель — ждём счёта от механика
+    else {
+      await bot.sendMessage(tgId, `✅ Ремонт завершён!\n💰 Выставьте счёт водителю через кнопку «💰 Выставить счёт».`);
+      notifyManagers(`✅ Механик ${r.mechFio} завершил <b>${r.id}</b>\n🚗 ${r.car}\n💰 Ожидает счёта водителю`);
+    }
+    return;
+  }
+
+  // Выставить счёт водителю
+  if (action === "mech_send_bill") {
+    sessions.set(tgId, { state: "mech_bill", data: { pageId, repair: r } });
+    return bot.sendMessage(tgId,
+      `💰 Введите стоимость ваших услуг для <b>${r.id}</b> (₽):\n\n<i>Эта сумма будет отправлена водителю для подтверждения.</i>`,
+      { parse_mode: "HTML", ...kbCancel });
+  }
+
+  // Комментарий механика
+  if (action === "mech_comment") {
+    sessions.set(tgId, { state: "mech_comment", data: { pageId, repair: r } });
+    return bot.sendMessage(tgId, `💬 Комментарий к <b>${r.id}</b>:`, { parse_mode: "HTML", ...kbCancel });
+  }
+
+  // ── Водитель: согласие с оплатой ────────────────────────────────────────────
+
+  if (action === "drv_agree_cost") {
+    await upd(pageId, { "Согласие водителя": sel("Согласен") });
+    await bot.sendMessage(tgId, `✅ Стоимость ремонта подтверждена. Спасибо!`, kbDriver);
+    notifyManagers(`💰 Водитель <b>${r.driver}</b> согласился с оплатой ${r.mechCost}₽\nЗаявка: <b>${r.id}</b>`);
+    return;
+  }
+
+  if (action === "drv_dispute_cost") {
+    await upd(pageId, { "Согласие водителя": sel("Оспаривает") });
+    await bot.sendMessage(tgId, `⚠️ Мы зафиксировали ваш спор. Менеджер свяжется с вами.`, kbDriver);
+    notifyManagers(`⚠️ Водитель <b>${r.driver}</b> оспаривает стоимость ремонта!\nЗаявка: <b>${r.id}</b> | Сумма: ${r.mechCost}₽`);
+    return;
   }
 });
 
-/** Обновить inline-сообщение карточки ремонта */
-async function editRepairMsg(q, r) {
-  try {
-    await bot.editMessageText(repairText(r), {
-      chat_id:      q.message.chat.id,
-      message_id:   q.message.message_id,
-      parse_mode:   "HTML",
-      reply_markup: repairAdminKb(r.pageId, r.status),
-    });
-  } catch (e) { /* сообщение могло удалиться */ }
+// ─── ВЫБОР МЕХАНИКА ───────────────────────────────────────────────────────────
+
+async function chooseMechanic(tgId, repair) {
+  const mechs = await qry(DB.staff, { and: [
+    { property: "Роль",   select: { equals: "Механик" } },
+    { property: "Статус", select: { equals: "Активен" } },
+  ]});
+
+  if (!mechs.length) {
+    sessions.set(tgId, { ...sessions.get(tgId), state: "m_assign_mech_text" });
+    return bot.sendMessage(tgId, "Нет доступных механиков в базе.\nВведите ФИО механика вручную:", kbCancel);
+  }
+
+  const buttons = mechs.map(p => [{
+    text: `🔧 ${gTtl(p,"ФИО")} (${gTxt(p,"СТО")||"—"})`,
+    callback_data: `mech_sel:${repair.pageId}:${p.id}`
+  }]);
+  buttons.push([{ text: "✏️ Ввести вручную", callback_data: `mech_sel_manual:${repair.pageId}` }]);
+
+  await bot.sendMessage(tgId, `Назначьте механика для <b>${repair.id}</b>:`,
+    { parse_mode: "HTML", reply_markup: { inline_keyboard: buttons } });
 }
 
-/** Отправить уведомление водителю */
-async function notifyDriver(r, text) {
-  if (!r.driverTg) return;
-  bot.sendMessage(r.driverTg, text, { parse_mode: "HTML" }).catch(() => {});
-}
+// ─── FSM ──────────────────────────────────────────────────────────────────────
 
-// ─── FSM ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ──────────────────────────────────────
-
-bot.on("message", async (msg) => {
+async function handleFSM(msg, session) {
   const tgId = msg.from.id;
   const text = msg.text || "";
-  const session = sessions.get(tgId);
+  const { state, data } = session;
+  const user = await getUser(tgId);
 
-  // Отмена
-  if (text === "❌ Отмена") {
-    sessions.delete(tgId);
-    const user = await getUser(tgId);
-    return bot.sendMessage(tgId, "Действие отменено.", user ? menuFor(user) : { reply_markup: { remove_keyboard: true } });
-  }
-
-  if (!session) return;
-
-  // ── Выбор типа ремонта ──────────────────────────────────────────────────
-  if (session.state === "rep_type") {
+  // Тип ремонта
+  if (state === "rep_type") {
     const type = TYPE_MAP[text];
     if (!type) return;
-    session.data.repairType = type;
-    session.data.repairLabel = text;
+    data.repairType  = type;
+    data.defaultPayer = PAY_DEFAULT[type] || "Парк";
     session.state = "rep_desc";
     sessions.set(tgId, session);
-    return bot.sendMessage(tgId,
-      `📝 Опишите неисправность:\n<i>Например: «стук в двигателе при холодном запуске»</i>`,
-      { parse_mode: "HTML", ...cancelKb });
+    return bot.sendMessage(tgId, `📝 Опишите неисправность:`, kbCancel);
   }
 
-  // ── Описание ────────────────────────────────────────────────────────────
-  if (session.state === "rep_desc") {
-    session.data.desc = text;
+  // Описание
+  if (state === "rep_desc") {
+    data.desc = text;
     session.state = "rep_photo";
     sessions.set(tgId, session);
-    return bot.sendMessage(tgId,
-      `📷 Пришлите фото неисправности\nИли нажмите «Пропустить»`,
+    return bot.sendMessage(tgId, `📷 Пришлите фото или нажмите «Пропустить»`,
       { reply_markup: { keyboard: [[{ text: "⏭ Пропустить" }],[{ text: "❌ Отмена" }]], resize_keyboard: true } });
   }
 
-  // ── Фото пропущено ──────────────────────────────────────────────────────
-  if (session.state === "rep_photo" && text === "⏭ Пропустить") {
-    await createRepair(tgId, session.data, null);
+  // Фото пропущено
+  if (state === "rep_photo" && text === "⏭ Пропустить") {
     sessions.delete(tgId);
+    return createRepair(tgId, data, null);
+  }
+
+  // СТО вручную (после согласования)
+  if (state === "m_approve_sto_text") {
+    const parts   = text.split(",");
+    const stoName = parts[0].trim();
+    const stoAddr = parts.slice(1).join(",").trim();
+    data.sto     = stoName;
+    data.stoAddr = stoAddr;
+    session.state = "m_assign_mech_after_sto";
+    sessions.set(tgId, session);
+    return chooseMechanic(tgId, data.repair);
+  }
+
+  // Отклонение: причина
+  if (state === "m_reject_reason") {
+    const { pageId, repair: r } = data;
+    await upd(pageId, { "Статус": sel("Отменено"), "Комментарий механика": rt(text) });
+    sessions.delete(tgId);
+    await bot.sendMessage(tgId, `❌ ${r.id} отклонён.`, kbManager);
+    notifyDriver(r, `❌ Заявка <b>${r.id}</b> отклонена.\nПричина: ${text}`);
     return;
   }
 
-  // ── Согласование: ввод СТО ──────────────────────────────────────────────
-  if (session.state === "rep_approve_sto") {
-    const { pageId, repair: r } = session.data;
-
-    // Парсим "АвтоМастер, 3500р"
-    const costMatch = text.match(/(\d[\d\s]*)/);
-    const cost = costMatch ? parseFloat(costMatch[1].replace(/\s/g,"")) : null;
-    const sto  = text.replace(/,.*$/, "").trim();
-
-    await notionUpdate(pageId, {
-      "Статус":                sel("Согласовано"),
-      "Исполнитель / СТО":     rt(sto),
-      ...(cost ? { "Стоимость ремонта": num(cost) } : {}),
-    });
-
-    r.status = "Согласовано";
-    r.sto    = sto;
-    r.cost   = cost;
-    sessions.delete(tgId);
-
-    await bot.sendMessage(tgId, `✅ Заявка ${r.id} согласована!\nСТО: ${sto}${cost ? `, стоимость: ${cost}₽` : ""}`, adminKb);
-    await notifyDriver(r,
-      `✅ Заявка <b>${r.id}</b> согласована!\n🚗 ${r.car}\n🏠 СТО: <b>${sto}</b>${cost ? `\n💰 Стоимость: ~${cost}₽` : ""}\n\nМы сообщим когда машина будет готова.`);
-    return;
-  }
-
-  // ── Причина отклонения ──────────────────────────────────────────────────
-  if (session.state === "rep_reject_reason") {
-    const { pageId, repair: r } = session.data;
-    await notionUpdate(pageId, {
-      "Статус": sel("Отменено"),
-      "Комментарий механика": rt(text),
-    });
-    r.status = "Отменено";
-    sessions.delete(tgId);
-    await bot.sendMessage(tgId, `❌ Заявка ${r.id} отклонена.`, adminKb);
-    await notifyDriver(r, `❌ Заявка <b>${r.id}</b> отклонена.\nПричина: ${text}`);
-    return;
-  }
-
-  // ── Указать стоимость ───────────────────────────────────────────────────
-  if (session.state === "rep_set_cost") {
-    const { pageId, repair: r } = session.data;
+  // Стоимость (менеджер)
+  if (state === "m_set_cost") {
     const cost = parseFloat(text.replace(/[^\d.]/g,""));
     if (isNaN(cost)) return bot.sendMessage(tgId, "⚠️ Введите число, например: 3500");
-    await notionUpdate(pageId, { "Стоимость ремонта": num(cost) });
+    const { pageId, repair: r } = data;
+    await upd(pageId, { "Стоимость ремонта": num(cost) });
     sessions.delete(tgId);
-    await bot.sendMessage(tgId, `💰 Стоимость ${r.id} обновлена: ${cost}₽`, adminKb);
-    await notifyDriver(r, `💰 Стоимость ремонта вашего авто <b>${r.car}</b>: <b>${cost}₽</b>`);
+    await bot.sendMessage(tgId, `💰 Стоимость ${r.id} — ${cost}₽ сохранена.`, kbManager);
+    if (r.payer === "Водитель")
+      notifyDriver(r, `💰 Стоимость ремонта <b>${r.id}</b>: <b>${cost}₽</b>`);
     return;
   }
 
-  // ── Комментарий механика ────────────────────────────────────────────────
-  if (session.state === "rep_add_comment") {
-    const { pageId, repair: r } = session.data;
-    await notionUpdate(pageId, { "Комментарий механика": rt(text) });
+  // Комментарий (менеджер)
+  if (state === "m_comment") {
+    const { pageId, repair: r } = data;
+    await upd(pageId, { "Комментарий механика": rt(text) });
     sessions.delete(tgId);
-    await bot.sendMessage(tgId, `💬 Комментарий к ${r.id} сохранён.`, adminKb);
+    await bot.sendMessage(tgId, `💬 Комментарий сохранён.`, kbManager);
     return;
   }
 
-  // ── Найти водителя ──────────────────────────────────────────────────────
-  if (session.state === "find_driver") {
+  // Комментарий (механик)
+  if (state === "mech_comment") {
+    const { pageId, repair: r } = data;
+    await upd(pageId, { "Комментарий механика": rt(text) });
     sessions.delete(tgId);
-    const all = await notionQuery(DB.drivers);
-    const query = text.toLowerCase();
-    const found = all.filter(p => {
-      const fio   = getTitle(p,"ФИО").toLowerCase();
-      const phone = getPhone(p,"Телефон");
-      return fio.includes(query) || phone.includes(query);
-    });
+    await bot.sendMessage(tgId, `💬 Комментарий сохранён.`, kbMechanic);
+    return;
+  }
 
-    if (!found.length) return bot.sendMessage(tgId, "❌ Не найдено.", adminKb);
+  // Счёт водителю (механик)
+  if (state === "mech_bill") {
+    const cost = parseFloat(text.replace(/[^\d.]/g,""));
+    if (isNaN(cost)) return bot.sendMessage(tgId, "⚠️ Введите сумму, например: 1500");
+    const { pageId, repair: r } = data;
+    await upd(pageId, { "Стоимость услуг механика": num(cost), "Согласие водителя": sel("Ожидает") });
+    sessions.delete(tgId);
+    await bot.sendMessage(tgId, `✅ Счёт ${cost}₽ выставлен водителю.`, kbMechanic);
 
+    // Отправляем водителю запрос на подтверждение
+    if (r.driverTg) {
+      bot.sendMessage(r.driverTg,
+        `💰 <b>Ремонт вашего авто ${r.car}</b>\n\nМеханик: ${r.mechFio}\nСтоимость услуг: <b>${cost}₽</b>\n\nПодтвердите оплату:`,
+        { parse_mode: "HTML", reply_markup: { inline_keyboard: [[
+          { text: "✅ Согласен", callback_data: `drv_agree_cost:${pageId}` },
+          { text: "❌ Оспорить", callback_data: `drv_dispute_cost:${pageId}` },
+        ]]}}).catch(()=>{});
+    }
+    return;
+  }
+
+  // Поиск водителя
+  if (state === "find_driver") {
+    sessions.delete(tgId);
+    const all = await qry(DB.drivers);
+    const q2  = text.toLowerCase();
+    const found = all.filter(p => gTtl(p,"ФИО").toLowerCase().includes(q2) || gPh(p,"Телефон").includes(q2));
+    if (!found.length) return bot.sendMessage(tgId, "❌ Не найдено.", kbManager);
     for (const p of found.slice(0,5)) {
-      const fio  = getTitle(p,"ФИО");
-      const ph   = getPhone(p,"Телефон");
-      const car  = getText(p,"Гос. номер авто");
-      const stat = getSel(p,"Статус");
       await bot.sendMessage(tgId,
-        `👤 <b>${fio}</b>\n📱 ${ph}\n🚗 ${car || "—"}\n📋 ${stat}`,
+        `👤 <b>${gTtl(p,"ФИО")}</b>\n📱 ${gPh(p,"Телефон")}\n🚗 ${gTxt(p,"Гос. номер авто")||"—"}\n📋 ${gSel(p,"Статус")}`,
         { parse_mode: "HTML" });
     }
-    await bot.sendMessage(tgId, "—", adminKb);
-    return;
+    return bot.sendMessage(tgId, "—", kbManager);
   }
 
-  // ── Рассылка ────────────────────────────────────────────────────────────
-  if (session.state === "broadcast") {
+  // Рассылка
+  if (state === "broadcast") {
     sessions.delete(tgId);
-    const all = await notionQuery(DB.drivers, { property: "Статус", select: { equals: "Работает" } });
-    const broadcastText = `📣 <b>Сообщение от администрации:</b>\n\n${text}`;
+    const all = await qry(DB.drivers, { property: "Статус", select: { equals: "Работает" } });
     let sent = 0;
     for (const p of all) {
-      const tid = getText(p,"Telegram ID");
+      const tid = gTxt(p,"Telegram ID");
       if (!tid) continue;
-      try {
-        await bot.sendMessage(tid, broadcastText, { parse_mode: "HTML" });
-        sent++;
-      } catch {}
+      try { await bot.sendMessage(tid, `📣 <b>Сообщение от администрации:</b>\n\n${text}`, { parse_mode: "HTML" }); sent++; }
+      catch {}
       await new Promise(r => setTimeout(r, 100));
     }
-    return bot.sendMessage(tgId, `✅ Рассылка завершена. Отправлено: ${sent} из ${all.length}`, adminKb);
+    return bot.sendMessage(tgId, `✅ Отправлено: ${sent}/${all.length}`, kbManager);
   }
-});
+}
 
-// ─── ФОТО РЕМОНТА ─────────────────────────────────────────────────────────────
+// ─── ФОТО ─────────────────────────────────────────────────────────────────────
 
 bot.on("photo", async (msg) => {
   const tgId = msg.from.id;
-  const session = sessions.get(tgId);
-  if (!session || session.state !== "rep_photo") return;
-  await createRepair(tgId, session.data, msg.photo.at(-1).file_id);
-  sessions.delete(tgId);
+  const sess = sessions.get(tgId);
+  if (!sess) return;
+  if (sess.state === "rep_photo") {
+    sessions.delete(tgId);
+    await createRepair(tgId, sess.data, msg.photo.at(-1).file_id);
+  }
 });
 
-// ─── СОЗДАТЬ РЕМОНТ В NOTION ──────────────────────────────────────────────────
+// ─── СОЗДАТЬ РЕМОНТ ───────────────────────────────────────────────────────────
 
-async function createRepair(tgId, data, photoFileId) {
+async function createRepair(tgId, data, _photo) {
   const user     = await getUser(tgId);
   const repairId = await nextId("REM", DB.repairs);
+  const payer    = data.defaultPayer || "Парк";
 
-  const page = await notionCreate(DB.repairs, {
+  const page = await crt(DB.repairs, {
     "ID заявки":              ttl(repairId),
-    "Гос. номер авто":        rt(data.car || ""),
-    "ФИО водителя":           rt(user?.fio || ""),
+    "Гос. номер авто":        rt(data.car||""),
+    "ФИО водителя":           rt(user?.fio||""),
     "Telegram ID водителя":   rt(String(tgId)),
-    "Дата подачи заявки":     { date: { start: new Date().toISOString() } },
-    "Тип ремонта":            sel(data.repairType || "Диагностика"),
-    "Описание поломки":       rt(data.desc || ""),
+    "Тип ремонта":            sel(data.repairType||"Диагностика"),
+    "Описание поломки":       rt(data.desc||""),
     "Статус":                 sel("Заявка"),
+    "Кто оплачивает":         sel(payer),
+    "date:Дата подачи заявки:start":       new Date().toISOString().slice(0,10),
+    "date:Дата подачи заявки:is_datetime": 0,
   });
 
-  const r = parseRepair(page);
-  r.id    = repairId;
-  r.car   = data.car;
-  r.driver= user?.fio || "";
-  r.driverTg = String(tgId);
-  r.type  = data.repairType;
-  r.desc  = data.desc;
+  const r      = parseRepair(page);
+  r.id         = repairId;
+  r.car        = data.car;
+  r.driver     = user?.fio||"";
+  r.driverTg   = String(tgId);
+  r.type       = data.repairType;
+  r.desc       = data.desc;
+  r.payer      = payer;
 
-  // Уведомление водителю
-  const user2 = await getUser(tgId);
+  const payIcon = payer === "Парк" ? "🏢 За счёт парка" : "👤 За счёт водителя";
   await bot.sendMessage(tgId,
-    `✅ <b>Заявка ${repairId} создана!</b>\n\n🚗 ${data.car}\n🔩 ${data.desc}\n\nАдминистратор рассмотрит заявку.`,
-    { parse_mode: "HTML", ...menuFor(user2) });
+    `✅ <b>Заявка ${repairId} создана!</b>\n🚗 ${data.car}\n🔩 ${data.desc}\n${payIcon}\n\nОжидайте решения менеджера.`,
+    { parse_mode: "HTML", ...kbDriver });
 
-  // Уведомление всем админам с кнопками
+  // Уведомляем менеджеров с кнопками
   const adminText =
-    `🚨 <b>Новая заявка!</b>\n\n` +
-    `📋 <b>${repairId}</b>\n👤 ${user?.fio}\n🚗 ${data.car}\n` +
-    `🔩 ${data.repairType}\n📝 ${data.desc}`;
+    `🚨 <b>Новая заявка ${repairId}</b>\n\n` +
+    `🚗 <b>${data.car}</b>\n👤 ${user?.fio}\n` +
+    `🔩 ${data.repairType}\n📝 ${data.desc}\n` +
+    `💰 Платит: <b>${payer}</b>`;
 
-  for (const a of ADMIN_IDS) {
+  for (const a of await getManagerIds()) {
     bot.sendMessage(a, adminText, {
       parse_mode: "HTML",
-      reply_markup: repairAdminKb(page.id, "Заявка"),
-    }).catch(() => {});
+      reply_markup: managerRepairKb(page.id, r),
+    }).catch(()=>{});
   }
+}
+
+// ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────────────────────
+
+// Получить Telegram ID всех менеджеров и администраторов
+async function getManagerIds() {
+  const ids = new Set(ADMIN_IDS);
+  const mgrs = await qry(DB.staff, { and: [
+    { property: "Роль",   select: { does_not_equal: "Механик" } },
+    { property: "Статус", select: { equals: "Активен" } },
+  ]});
+  for (const p of mgrs) { const tid = gTxt(p,"Telegram ID"); if (tid) ids.add(tid); }
+  return [...ids];
+}
+
+function notifyDriver(r, text) {
+  if (!r.driverTg) return;
+  bot.sendMessage(r.driverTg, text, { parse_mode: "HTML" }).catch(()=>{});
+}
+
+async function notifyManagers(text) {
+  const ids = await getManagerIds();
+  for (const id of ids) bot.sendMessage(id, text, { parse_mode: "HTML" }).catch(()=>{});
+}
+
+async function startFindDriver(tgId) {
+  sessions.set(tgId, { state: "find_driver" });
+  await bot.sendMessage(tgId, "Введите ФИО или телефон:", kbCancel);
+}
+
+async function startBroadcast(tgId) {
+  sessions.set(tgId, { state: "broadcast" });
+  await bot.sendMessage(tgId, "📣 Введите текст рассылки:", kbCancel);
+}
+
+function editMsg(q, text, kb) {
+  return bot.editMessageText(text, {
+    chat_id: q.message.chat.id, message_id: q.message.message_id,
+    parse_mode: "HTML", reply_markup: kb,
+  }).catch(()=>{});
 }
 
 // ─── ЕЖЕДНЕВНЫЕ УВЕДОМЛЕНИЯ ───────────────────────────────────────────────────
 
-cron.schedule("0 6 * * *", () => checkDeadlines(ADMIN_IDS));
+cron.schedule("0 6 * * *", async () => {
+  const ids = await getManagerIds();
+  checkDeadlines(ids);
+});
 
 async function checkDeadlines(adminIds) {
-  const today  = new Date();
-  const in30   = new Date(today.getTime() + 30 * 86400000).toISOString().slice(0,10);
-  const todayS = today.toISOString().slice(0,10);
+  const today = new Date();
+  const in30  = new Date(today.getTime()+30*86400000).toISOString().slice(0,10);
+  const todS  = today.toISOString().slice(0,10);
   const alerts = [];
 
-  // Страховки
   try {
-    const ins = await notion.databases.query({ database_id: DB.insurances, filter: {
-      and: [
-        { property: "Дата окончания действия", date: { before: in30 } },
-        { property: "Дата окончания действия", date: { after: todayS } },
-      ]
-    }});
+    const ins = await notion.databases.query({ database_id: DB.insurances, filter: { and: [
+      { property: "Дата окончания действия", date: { before: in30 } },
+      { property: "Дата окончания действия", date: { after: todS } },
+    ]}});
     for (const p of ins.results) {
-      const car  = getText(p,"Гос. номер авто");
-      const type = getSel(p,"Тип страховки");
-      const end  = getDate(p,"Дата окончания действия");
-      const days = Math.ceil((new Date(end) - today) / 86400000);
-      alerts.push(`⚠️ <b>${type}</b> ${car} — истекает через <b>${days} дн.</b> (${end})`);
+      const days = Math.ceil((new Date(gDate(p,"Дата окончания действия")) - today)/86400000);
+      alerts.push(`⚠️ ${gSel(p,"Тип страховки")} ${gTxt(p,"Гос. номер авто")} — ${days} дн.`);
     }
   } catch {}
 
-  // Техосмотры
   try {
-    const ins = await notion.databases.query({ database_id: DB.inspections, filter: {
-      and: [
-        { property: "Действует до", date: { before: in30 } },
-        { property: "Действует до", date: { after: todayS } },
-      ]
-    }});
+    const ins = await notion.databases.query({ database_id: DB.inspections, filter: { and: [
+      { property: "Действует до", date: { before: in30 } },
+      { property: "Действует до", date: { after: todS } },
+    ]}});
     for (const p of ins.results) {
-      const car  = getText(p,"Гос. номер авто");
-      const end  = getDate(p,"Действует до");
-      const days = Math.ceil((new Date(end) - today) / 86400000);
-      alerts.push(`🚗 <b>Техосмотр</b> ${car} — истекает через <b>${days} дн.</b> (${end})`);
+      const days = Math.ceil((new Date(gDate(p,"Действует до")) - today)/86400000);
+      alerts.push(`🚗 Техосмотр ${gTxt(p,"Гос. номер авто")} — ${days} дн.`);
     }
   } catch {}
 
   if (!alerts.length) return;
-  const msg = `🔔 <b>Уведомления на сегодня:</b>\n\n` + alerts.join("\n");
-  for (const a of adminIds) {
-    bot.sendMessage(a, msg, { parse_mode: "HTML" }).catch(() => {});
-  }
-}
-
-// ─── МИНИ-ПРИЛОЖЕНИЕ ─────────────────────────────────────────────────────────
-
-if (APP_URL) {
-  app.get("/", (req, res) => res.sendFile(__dirname + "/public/index.html"));
+  const msg = `🔔 <b>Истекающие сроки:</b>\n\n` + alerts.join("\n");
+  for (const a of adminIds) bot.sendMessage(a, msg, { parse_mode: "HTML" }).catch(()=>{});
 }
 
 // ─── WEBHOOK ─────────────────────────────────────────────────────────────────
@@ -832,24 +1067,13 @@ if (APP_URL) {
 if (APP_URL) {
   const wPath = `/webhook/${BOT_TOKEN}`;
   app.post(wPath, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
-  bot.setWebHook(`${APP_URL}${wPath}`)
-    .then(() => console.log(`✅ Webhook: ${APP_URL}${wPath}`))
-    .catch(e  => console.error("Webhook error:", e.message));
+  bot.setWebHook(`${APP_URL}${wPath}`).then(() => console.log(`✅ Webhook set`)).catch(e => console.error(e));
+  app.get("/", (req, res) => res.sendFile(__dirname + "/public/index.html"));
 
   fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setChatMenuButton`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ menu_button: { type: "web_app", text: "📅 Выходные", web_app: { url: APP_URL } } })
-  }).then(r => r.json()).then(r => console.log("✅ Menu button:", r.ok)).catch(() => {});
+  }).then(r=>r.json()).then(r=>console.log("✅ Menu:", r.ok)).catch(()=>{});
 }
 
-// ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────────────────────
-
-async function askPhone(tgId) {
-  sessions.set(tgId, { state: "waiting_phone" });
-  bot.sendMessage(tgId, "❗ Поделитесь номером телефона для входа:", sharePhoneKb);
-}
-
-// ─── ЗАПУСК ───────────────────────────────────────────────────────────────────
-
-app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
