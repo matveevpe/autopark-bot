@@ -240,6 +240,7 @@ bot.onText(/\/start/, async (msg) => {
   const name  = msg.from.first_name || "водитель";
 
   try {
+    userCache.delete(tgId); // Всегда свежие данные из Notion при /start
     const user = await findDriverByTelegramId(tgId);
 
     if (user) {
@@ -537,6 +538,44 @@ bot.onText(/^🏖 Отпуск \/ Больничный$/, async (msg) => {
       },
     }
   );
+});
+
+// ─── DEBUG КОМАНДА ───────────────────────────────────────────────────────────────
+
+bot.onText(/\/debug/, async (msg) => {
+  const tgId = msg.from.id;
+  if (!ADMIN_IDS.includes(String(tgId))) return;
+
+  try {
+    userCache.delete(tgId);
+    const pages = await notionQuery(DB.drivers, {
+      property: "Telegram ID",
+      rich_text: { equals: String(tgId) },
+    });
+
+    if (!pages.length) {
+      await bot.sendMessage(tgId, "❌ Страница не найдена в Notion");
+      return;
+    }
+
+    const p = pages[0];
+    const props = p.properties;
+
+    // Показываем все текстовые поля
+    const lines = [`🔍 Debug (page ${p.id})
+`];
+    for (const [key, val] of Object.entries(props)) {
+      let v = "—";
+      if (val.type === "rich_text")   v = val.rich_text?.[0]?.plain_text || "(пусто)";
+      if (val.type === "title")       v = val.title?.[0]?.plain_text || "(пусто)";
+      if (val.type === "phone_number") v = val.phone_number || "(пусто)";
+      if (val.type === "select")      v = val.select?.name || "(пусто)";
+      lines.push(`${key}: [${val.type}] = ${v}`);
+    }
+    await bot.sendMessage(tgId, lines.join("\n"));
+  } catch(e) {
+    await bot.sendMessage(tgId, `❌ Ошибка: ${e.message}`);
+  }
 });
 
 // ─── МИНИ-ПРИЛОЖЕНИЕ (совместимость со старым ботом) ─────────────────────────
