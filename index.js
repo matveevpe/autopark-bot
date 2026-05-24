@@ -1216,4 +1216,57 @@ app.post("/api/vacation", async (req, res) => {
   }
 });
 
+
+// ─── API ДЛЯ МИНИ-ПРИЛОЖЕНИЯ ──────────────────────────────────────────────────
+
+// Проверка: является ли tgId менеджером/администратором
+async function isManagerOrAdmin(tgId) {
+  if (!tgId) return false;
+  if (ADMIN_IDS.includes(String(tgId))) return true;
+  const pages = await qry(DB.staff, { and: [
+    { property: "Telegram ID", rich_text: { equals: String(tgId) } },
+    { property: "Роль", select: { does_not_equal: "Механик" } },
+  ]}).catch(() => []);
+  return pages.length > 0;
+}
+
+// GET /api/employees — список водителей (только для менеджеров/админов)
+app.get("/api/employees", async (req, res) => {
+  const tgId = req.query.tgId;
+  const ok = await isManagerOrAdmin(tgId);
+  if (!ok) return res.status(403).json({ error: "no access" });
+
+  try {
+    const pages = await qry(DB.drivers, {
+      property: "Статус", select: { equals: "Работает" }
+    });
+    const employees = pages
+      .map(p => gTtl(p, "ФИО"))
+      .filter(Boolean)
+      .sort();
+    res.json({ employees });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/vacation — создать запись об отпуске/выходных
+app.post("/api/vacation", async (req, res) => {
+  const { employee, month, type, days, tgId } = req.body;
+  const ok = await isManagerOrAdmin(tgId);
+  if (!ok) return res.status(403).json({ error: "no access" });
+
+  try {
+    await crt(DB.absences, {
+      "Сотрудник": ttl(employee),
+      "Месяц":     sel(month),
+      "Тип":       sel(type),
+      "Дни":       rt(days),
+    });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
