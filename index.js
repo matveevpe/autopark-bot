@@ -114,6 +114,27 @@ async function lookupByTgId(tgId) {
   return null;
 }
 
+// Найти профиль водителя по телефону (для переключения режима)
+async function findDriverProfile(tgId, phone) {
+  const n = norm(phone);
+  const all = await qry(DB.drivers);
+  const page = all.find(p => norm(gPh(p,"Телефон")) === n);
+  if (!page) return null;
+  return buildDriverUser(page, tgId);
+}
+
+// Найти профиль сотрудника по телефону
+async function lookupStaffByPhone(phone) {
+  const n = norm(phone);
+  const all = await qry(DB.staff);
+  const page = all.find(p => norm(gPh(p,"Телефон")) === n);
+  if (!page) return null;
+  // Используем текущий tgId из кэша — не меняем его
+  const entries = [...cache.entries()];
+  const tgId = entries.find(([,u]) => norm(u.phone) === n)?.[0];
+  return buildStaffUser(page, tgId || "");
+}
+
 async function findByPhone(phone) {
   const n = norm(phone);
   // Проверяем оба справочника
@@ -127,13 +148,14 @@ async function findByPhone(phone) {
 function buildStaffUser(page, tgId) {
   const u = {
     tgId,
-    pageId: page.id,
-    fio:    gTtl(page,"ФИО"),
-    phone:  gPh(page,"Телефон"),
-    role:   gSel(page,"Роль"),  // Менеджер / Механик / Администратор
-    sto:    gTxt(page,"СТО"),
-    isAdmin: ADMIN_IDS.includes(String(tgId)) || gSel(page,"Роль") === "Администратор",
-    db:     "staff",
+    pageId:   page.id,
+    fio:      gTtl(page,"ФИО"),
+    phone:    gPh(page,"Телефон"),
+    role:     gSel(page,"Роль"),  // Менеджер / Механик / Администратор
+    baseRole: gSel(page,"Роль"),  // Сохраняем исходную роль для переключения
+    sto:      gTxt(page,"СТО"),
+    isAdmin:  ADMIN_IDS.includes(String(tgId)) || gSel(page,"Роль") === "Администратор",
+    db:       "staff",
   };
   cache.set(tgId, u);
   return u;
@@ -166,10 +188,18 @@ const kbDriver = { reply_markup: { keyboard: [
   [{ text: "📊 Мой статус" },       { text: "📋 Мои заявки" }],
 ], resize_keyboard: true }};
 
+// Меню водителя с кнопкой возврата (для тех кто совмещает роли)
+const kbDriverWithSwitch = { reply_markup: { keyboard: [
+  [{ text: "🛠 Заявка на ремонт" }, { text: "🏖 Отпуск / Больничный" }],
+  [{ text: "📊 Мой статус" },       { text: "📋 Мои заявки" }],
+  [{ text: "👔 Режим менеджера" }],
+], resize_keyboard: true }};
+
 const kbManager = { reply_markup: { keyboard: [
   [{ text: "🔧 Активные ремонты" }, { text: "📊 Статистика парка" }],
   [{ text: "👥 Найти водителя" },    { text: "📣 Рассылка" }],
   [{ text: "🏪 Сервисные центры" }, { text: "🔔 Проверить сроки" }],
+  [{ text: "🚗 Режим водителя" }],
 ], resize_keyboard: true }};
 
 const kbMechanic = { reply_markup: { keyboard: [
@@ -184,6 +214,8 @@ function menuFor(user) {
   if (!user) return kbPhone;
   if (user.role === "Механик")     return kbMechanic;
   if (user.role === "Менеджер" || user.role === "Администратор" || user.isAdmin) return kbManager;
+  // Водительский режим: если у пользователя есть базовая роль менеджера/админа
+  if (user.db === "staff" || user.isAdmin) return kbDriverWithSwitch;
   return kbDriver;
 }
 
@@ -306,6 +338,32 @@ async function handleMenu(msg) {
   if (!user) {
     sessions.set(tgId, { state: "waiting_phone" });
     return bot.sendMessage(tgId, "Поделитесь номером для входа:", kbPhone);
+  }
+
+  // ── Переключение режима ─────────────────────────────────────────────────────
+  if (text === "🚗 Режим водителя") {
+    // Переключаем в водительский интерфейс
+    const drv = await findDriverProfile(tgId, user.phone);
+    if (!drv) return bot.sendMessage(tgId, "⚠️ У вас нет профиля водителя. Попросите добавить вас в базу Арендаторов.", kbManager);
+    cache.set(tgId, { ...drv, db: "staff", isAdmin: user.isAdmin, baseRole: user.baseRole || user.role });
+    return bot.sendMessage(tgId,
+      `🚗 <b>Режим водителя</b>
+
+👤 ${drv.fio}
+🚗 ${drv.car || "авто не привязано"}`,
+      { parse_mode: "HTML", ...kbDriverWithSwitch });
+  }
+
+  if (text === "👔 Режим менеджера") {
+    // Возвращаемся в менеджерский интерфейс
+    const staffUser = await lookupStaffByPhone(user.phone);
+    if (!staffUser) return bot.sendMessage(tgId, "⚠️ Профиль сотрудника не найден.", kbDriver);
+    cache.set(tgId, staffUser);
+    return bot.sendMessage(tgId,
+      `👔 <b>Режим менеджера</b>
+
+👤 ${staffUser.fio}`,
+      { parse_mode: "HTML", ...kbManager });
   }
 
   // ── Водитель ────────────────────────────────────────────────────────────────
