@@ -124,16 +124,20 @@ async function findDriverProfile(tgId, phone) {
 }
 
 // Найти профиль сотрудника по телефону
-async function lookupStaffByPhone(phone) {
+async function lookupStaffByPhone(phone, role) {
   const n = norm(phone);
   const all = await qry(DB.staff);
-  const page = all.find(p => norm(gPh(p,"Телефон")) === n);
+  const page = all.find(p => {
+    const phoneMatch = norm(gPh(p,"Телефон")) === n;
+    const roleMatch  = role ? gSel(p,"Роль") === role : true;
+    return phoneMatch && roleMatch;
+  });
   if (!page) return null;
-  // Используем текущий tgId из кэша — не меняем его
   const entries = [...cache.entries()];
   const tgId = entries.find(([,u]) => norm(u.phone) === n)?.[0];
   return buildStaffUser(page, tgId || "");
 }
+
 
 async function findByPhone(phone) {
   const n = norm(phone);
@@ -355,16 +359,24 @@ async function handleMenu(msg) {
   }
 
   if (text === "👔 Режим менеджера") {
-    // Возвращаемся в менеджерский интерфейс
-    const staffUser = await lookupStaffByPhone(user.phone);
-    if (!staffUser) return bot.sendMessage(tgId, "⚠️ Профиль сотрудника не найден.", kbDriver);
-    cache.set(tgId, staffUser);
+    const staffUser = await lookupStaffByPhone(user.phone, "Администратор") ||
+                      await lookupStaffByPhone(user.phone, "Менеджер");
+    if (!staffUser) return bot.sendMessage(tgId, "⚠️ Профиль менеджера не найден.", menuFor(user));
+    cache.set(tgId, { ...staffUser, isAdmin: user.isAdmin });
     return bot.sendMessage(tgId,
-      `👔 <b>Режим менеджера</b>
-
-👤 ${staffUser.fio}`,
+      `👔 <b>Режим менеджера</b>\n\n👤 ${staffUser.fio}`,
       { parse_mode: "HTML", ...kbManager });
   }
+
+  if (text === "🔧 Режим механика") {
+    const mechUser = await lookupStaffByPhone(user.phone, "Механик");
+    if (!mechUser) return bot.sendMessage(tgId, "⚠️ Профиль механика не найден.", menuFor(user));
+    cache.set(tgId, { ...mechUser, isAdmin: user.isAdmin });
+    return bot.sendMessage(tgId,
+      `🔧 <b>Режим механика</b>\n\n👤 ${mechUser.fio}\n🏪 ${mechUser.sto || "—"}`,
+      { parse_mode: "HTML", ...kbMechanicWithSwitch });
+  }
+
 
   // ── Водитель ────────────────────────────────────────────────────────────────
   if (text === "🛠 Заявка на ремонт") return startRepair(tgId, user);
