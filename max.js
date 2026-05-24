@@ -113,26 +113,38 @@ async function registerWebhook() {
 // кнопка с type:"message" отправляет свой текст как сообщение от пользователя
 
 const kb = {
+  // Одна кнопка в строку = 100% ширины на любом экране
   driver: [
-    [{ type:"message", text:"🛠 Заявка на ремонт" }, { type:"message", text:"🏖 Отпуск / Больничный" }],
-    [{ type:"message", text:"📊 Мой статус" },       { type:"message", text:"📋 Мои заявки" }],
+    [{ type:"message", text:"🛠 Заявка на ремонт" }],
+    [{ type:"message", text:"🏖 Отпуск / Больничный" }],
+    [{ type:"message", text:"📊 Мой статус" }],
+    [{ type:"message", text:"📋 Мои заявки" }],
   ],
   driverAdmin: [
-    [{ type:"message", text:"🛠 Заявка на ремонт" }, { type:"message", text:"🏖 Отпуск / Больничный" }],
-    [{ type:"message", text:"📊 Мой статус" },       { type:"message", text:"📋 Мои заявки" }],
-    [{ type:"message", text:"👔 Режим менеджера" },  { type:"message", text:"🔧 Режим механика" }],
+    [{ type:"message", text:"🛠 Заявка на ремонт" }],
+    [{ type:"message", text:"🏖 Отпуск / Больничный" }],
+    [{ type:"message", text:"📊 Мой статус" }],
+    [{ type:"message", text:"📋 Мои заявки" }],
+    [{ type:"message", text:"👔 Режим менеджера" }],
+    [{ type:"message", text:"🔧 Режим механика" }],
   ],
   manager: [
-    [{ type:"message", text:"🔧 Активные ремонты" }, { type:"message", text:"📊 Статистика парка" }],
-    [{ type:"message", text:"👥 Найти водителя" },    { type:"message", text:"🏪 Сервисные центры" }],
-    [{ type:"message", text:"📣 Рассылка" },          { type:"message", text:"🔔 Проверить сроки" }],
-    [{ type:"message", text:"🚗 Режим водителя" },    { type:"message", text:"🔧 Режим механика" }],
+    [{ type:"message", text:"🔧 Активные ремонты" }],
+    [{ type:"message", text:"📊 Статистика парка" }],
+    [{ type:"message", text:"👥 Найти водителя" }],
+    [{ type:"message", text:"🏪 Сервисные центры" }],
+    [{ type:"message", text:"📣 Рассылка" }],
+    [{ type:"message", text:"🔔 Проверить сроки" }],
+    [{ type:"message", text:"🚗 Режим водителя" }],
+    [{ type:"message", text:"🔧 Режим механика" }],
   ],
   mechanic: [
-    [{ type:"message", text:"🔧 Мои ремонты" },      { type:"message", text:"📊 Мой статус" }],
-    [{ type:"message", text:"👔 Режим менеджера" },  { type:"message", text:"🚗 Режим водителя" }],
+    [{ type:"message", text:"🔧 Мои ремонты" }],
+    [{ type:"message", text:"📊 Мой статус" }],
+    [{ type:"message", text:"👔 Режим менеджера" }],
+    [{ type:"message", text:"🚗 Режим водителя" }],
   ],
-  phone: [[{ type:"request_contact", text:"📱 Поделиться номером телефона" }]],
+  phone:  [[{ type:"request_contact", text:"📱 Поделиться номером телефона" }]],
   cancel: [[{ type:"message", text:"❌ Отмена" }]],
 };
 
@@ -432,10 +444,14 @@ async function startRepair(userId, user) {
   return maxSend(userId,
     `🛠 <b>Заявка на ремонт</b>\n🚗 ${user.car}\n\nВыберите тип проблемы:`,
     [
-      [{ type:"message", text:"🔧 Двигатель" },   { type:"message", text:"⚙️ КПП / Трансмиссия" }],
-      [{ type:"message", text:"🛞 Шиномонтаж" },  { type:"message", text:"💥 Кузов / Аварийный" }],
-      [{ type:"message", text:"🪟 Стекло" },       { type:"message", text:"🔋 Электрика" }],
-      [{ type:"message", text:"🩺 Диагностика" }, { type:"message", text:"❓ Другое" }],
+      [{ type:"message", text:"🔧 Двигатель" }],
+      [{ type:"message", text:"⚙️ КПП / Трансмиссия" }],
+      [{ type:"message", text:"🛞 Шиномонтаж" }],
+      [{ type:"message", text:"💥 Кузов / Аварийный" }],
+      [{ type:"message", text:"🪟 Стекло" }],
+      [{ type:"message", text:"🔋 Электрика" }],
+      [{ type:"message", text:"🩺 Диагностика" }],
+      [{ type:"message", text:"❓ Другое" }],
       [{ type:"message", text:"❌ Отмена" }],
     ]);
 }
