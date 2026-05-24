@@ -1340,3 +1340,11 @@ app.post("/api/vacation", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
+
+// ─── MAX МЕССЕНДЖЕР ───────────────────────────────────────────────────────────
+try {
+  const setupMaxBot = require('./max.js');
+  setupMaxBot(app);
+} catch(e) {
+  console.log('MAX бот не запущен:', e.message);
+}
