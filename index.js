@@ -130,7 +130,8 @@ async function lookupStaffByPhone(phone, role) {
   const all = await qry(DB.staff);
   const page = all.find(p => {
     const phoneMatch = norm(gPh(p,"Телефон")) === n;
-    const roleMatch  = role ? gSel(p,"Роль") === role : true;
+    // Роль теперь multi_select — используем gMulti
+    const roleMatch  = role ? gMulti(p,"Роль").includes(role) : true;
     return phoneMatch && roleMatch;
   });
   if (!page) return null;
