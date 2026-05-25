@@ -61,6 +61,7 @@ const sessions = new Map();   // tgId → { state, data }
 const gTxt  = (p,k) => { try { return p.properties[k].rich_text[0].plain_text; }     catch { return ""; }};
 const gTtl  = (p,k) => { try { return p.properties[k].title[0].plain_text; }         catch { return ""; }};
 const gSel  = (p,k) => { try { return p.properties[k].select?.name  || ""; }         catch { return ""; }};
+const gMulti = (p,k) => { try { return (p.properties[k].multi_select||[]).map(o=>o.name); } catch { return []; }};
 const gPh   = (p,k) => { try { return (p.properties[k].phone_number||"").replace(/\D/g,""); } catch { return ""; }};
 const gNum  = (p,k) => { try { return p.properties[k].number ?? null; }              catch { return null; }};
 const gDate = (p,k) => { try { return p.properties[k].date?.start   || ""; }         catch { return ""; }};
@@ -155,10 +156,11 @@ function buildStaffUser(page, tgId) {
     pageId:   page.id,
     fio:      gTtl(page,"ФИО"),
     phone:    gPh(page,"Телефон"),
-    role:     gSel(page,"Роль"),  // Менеджер / Механик / Администратор
-    baseRole: gSel(page,"Роль"),  // Сохраняем исходную роль для переключения
+    roles:    gMulti(page,"Роль"),
+    role:     (() => { const rs = gMulti(page,"Роль"); return rs.includes("Администратор")?"Администратор":rs.includes("Менеджер")?"Менеджер":rs[0]||"Механик"; })(),
+    baseRole: gMulti(page,"Роль"),  // все роли пользователя
     sto:      gTxt(page,"СТО"),
-    isAdmin:  ADMIN_IDS.includes(String(tgId)) || gSel(page,"Роль") === "Администратор",
+    isAdmin:  ADMIN_IDS.includes(String(tgId)) || gMulti(page,"Роль").includes("Администратор"),
     db:       "staff",
   };
   cache.set(tgId, u);
@@ -270,7 +272,8 @@ bot.on("contact", async (msg) => {
   // Если есть и в Сотрудниках и в Водителях — спрашиваем роль
   if (staffPage && drvPage) {
     sessions.set(tgId, { state: "choose_role", data: { phone, staffPageId: staffPage.id, drvPageId: drvPage.id, username: msg.from.username } });
-    const staffRole = gSel(staffPage, "Роль");
+    const staffRoles = gMulti(staffPage, "Роль");
+    const staffRole = staffRoles.join(" + ");
     return bot.sendMessage(tgId, "Вы совмещаете несколько ролей. Выберите как войти:",
       { reply_markup: { keyboard: [
         [{ text: `👔 ${staffRole}` }],
