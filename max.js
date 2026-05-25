@@ -194,7 +194,7 @@ function buildStaff(page, userId) {
     baseRole: gSel(page,"Роль"),
     sto:      gTxt(page,"СТО"),
     db:       "staff",
-    isAdmin:  ADMIN_IDS.includes(String(userId)) || gSel(page,"Роль") === "Администратор",
+    isAdmin:  ADMIN_IDS.includes(String(userId)) || gMulti(page,"Роль").includes("Администратор"),
   };
   maxCache.set(userId, u);
   return u;
@@ -331,7 +331,8 @@ async function handleContact(userId, contact, username) {
 
   // Оба профиля — спрашиваем роль
   if (staffPage && drvPage) {
-    const staffRole = gSel(staffPage, "Роль");
+    const staffRoles = gMulti(staffPage, "Роль");
+    const staffRole = staffRoles.join(" + ");
     maxSessions.set(userId, { state: "choose_role", data: {
       staffPageId: staffPage.id, drvPageId: drvPage.id, username
     }});
