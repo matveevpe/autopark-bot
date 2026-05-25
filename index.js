@@ -393,7 +393,25 @@ async function handleMenu(msg) {
   }
 
   // ── Переключение режима ─────────────────────────────────────────────────────
-  if (text === "🚗 Режим водителя") {
+  // Короткие кнопки переключения (3 в одну строку)
+  if (text === "👔 Менеджер" || text === "🚗 Режим водителя") {
+    if (text === "👔 Менеджер") {
+      const u = await switchToStaffRole(tgId, user, "Администратор", "Менеджер");
+      if (!u) return bot.sendMessage(tgId, "⚠️ Роль менеджера не найдена.", menuFor(user));
+      cache.set(tgId, u);
+      return bot.sendMessage(tgId, `👔 <b>Режим менеджера</b>\n\n👤 ${u.fio}`,
+        { parse_mode: "HTML", ...kbManager });
+    }
+  }
+  if (text === "🔧 Механик") {
+    const u = await switchToStaffRole(tgId, user, "Механик");
+    if (!u) return bot.sendMessage(tgId, "⚠️ Роль механика не найдена.", menuFor(user));
+    cache.set(tgId, u);
+    return bot.sendMessage(tgId,
+      `🔧 <b>Режим механика</b>\n\n👤 ${u.fio}\n🏪 ${u.sto || "—"}`,
+      { parse_mode: "HTML", ...kbMechanicWithSwitch });
+  }
+  if (text === "🚗 Водитель" || text === "🚗 Режим водителя") {
     // Переключаем в водительский интерфейс
     const drv = await findDriverProfile(tgId, user.phone);
     if (!drv) return bot.sendMessage(tgId, "⚠️ У вас нет профиля водителя. Попросите добавить вас в базу Арендаторов.", kbManager);
@@ -406,23 +424,7 @@ async function handleMenu(msg) {
       { parse_mode: "HTML", ...kbDriverWithSwitch });
   }
 
-  if (text === "👔 Режим менеджера") {
-    // Ищем staff-страницу по Telegram ID (надёжнее, чем по телефону)
-    const u = await switchToStaffRole(tgId, user, "Администратор", "Менеджер");
-    if (!u) return bot.sendMessage(tgId, "⚠️ Роль менеджера не найдена.", menuFor(user));
-    cache.set(tgId, u);
-    return bot.sendMessage(tgId, `👔 <b>Режим менеджера</b>\n\n👤 ${u.fio}`,
-      { parse_mode: "HTML", ...kbManager });
-  }
-
-  if (text === "🔧 Режим механика") {
-    const u = await switchToStaffRole(tgId, user, "Механик");
-    if (!u) return bot.sendMessage(tgId, "⚠️ Роль механика не найдена.", menuFor(user));
-    cache.set(tgId, u);
-    return bot.sendMessage(tgId,
-      `🔧 <b>Режим механика</b>\n\n👤 ${u.fio}\n🏪 ${u.sto || "—"}`,
-      { parse_mode: "HTML", ...kbMechanicWithSwitch });
-  }
+  // Обработчики 👔/🔧 перенесены в блок выше
 
 
   // ── Водитель ────────────────────────────────────────────────────────────────
