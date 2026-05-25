@@ -336,6 +336,50 @@ bot.on("message", async (msg) => {
   await handleFSM(msg, session);
 });
 
+/**
+ * Переключение в staff-роль.
+ * Ищет staff-страницу по TG ID, затем по телефону.
+ * Если пользователь в ADMIN_IDS — разрешает любую роль.
+ * Возвращает user-объект с нужной активной ролью.
+ */
+async function switchToStaffRole(tgId, currentUser, ...targetRoles) {
+  // 1. Ищем staff-страницу по TG ID напрямую
+  const byTgId = await qry(DB.staff, {
+    property: "Telegram ID", rich_text: { equals: String(tgId) }
+  });
+
+  // 2. Если не нашли по TG ID — ищем по телефону
+  const byPhone = byTgId.length ? [] : await qry(DB.staff);
+
+  const candidates = byTgId.length
+    ? byTgId
+    : byPhone.filter(p => norm(gPh(p,"Телефон")) === norm(currentUser.phone));
+
+  if (!candidates.length) return null;
+
+  // Ищем страницу где есть нужная роль
+  for (const targetRole of targetRoles) {
+    const page = candidates.find(p => gMulti(p,"Роль").includes(targetRole));
+    if (page) {
+      const u = buildStaffUser(page, tgId);
+      u.role = targetRole; // устанавливаем активную роль явно
+      u.isAdmin = currentUser.isAdmin;
+      return u;
+    }
+  }
+
+  // Если пользователь в ADMIN_IDS — разрешаем первую найденную страницу
+  // с переопределением роли (даже если роль не задана в Notion)
+  if (ADMIN_IDS.includes(String(tgId)) && candidates.length) {
+    const u = buildStaffUser(candidates[0], tgId);
+    u.role = targetRoles[0]; // берём первую запрашиваемую роль
+    u.isAdmin = true;
+    return u;
+  }
+
+  return null;
+}
+
 // ─── МЕНЮ ДЕЙСТВИЙ ────────────────────────────────────────────────────────────
 
 async function handleMenu(msg) {
@@ -363,21 +407,20 @@ async function handleMenu(msg) {
   }
 
   if (text === "👔 Режим менеджера") {
-    const staffUser = await lookupStaffByPhone(user.phone, "Администратор") ||
-                      await lookupStaffByPhone(user.phone, "Менеджер");
-    if (!staffUser) return bot.sendMessage(tgId, "⚠️ Профиль менеджера не найден.", menuFor(user));
-    cache.set(tgId, { ...staffUser, isAdmin: user.isAdmin });
-    return bot.sendMessage(tgId,
-      `👔 <b>Режим менеджера</b>\n\n👤 ${staffUser.fio}`,
+    // Ищем staff-страницу по Telegram ID (надёжнее, чем по телефону)
+    const u = await switchToStaffRole(tgId, user, "Администратор", "Менеджер");
+    if (!u) return bot.sendMessage(tgId, "⚠️ Роль менеджера не найдена.", menuFor(user));
+    cache.set(tgId, u);
+    return bot.sendMessage(tgId, `👔 <b>Режим менеджера</b>\n\n👤 ${u.fio}`,
       { parse_mode: "HTML", ...kbManager });
   }
 
   if (text === "🔧 Режим механика") {
-    const mechUser = await lookupStaffByPhone(user.phone, "Механик");
-    if (!mechUser) return bot.sendMessage(tgId, "⚠️ Профиль механика не найден.", menuFor(user));
-    cache.set(tgId, { ...mechUser, isAdmin: user.isAdmin });
+    const u = await switchToStaffRole(tgId, user, "Механик");
+    if (!u) return bot.sendMessage(tgId, "⚠️ Роль механика не найдена.", menuFor(user));
+    cache.set(tgId, u);
     return bot.sendMessage(tgId,
-      `🔧 <b>Режим механика</b>\n\n👤 ${mechUser.fio}\n🏪 ${mechUser.sto || "—"}`,
+      `🔧 <b>Режим механика</b>\n\n👤 ${u.fio}\n🏪 ${u.sto || "—"}`,
       { parse_mode: "HTML", ...kbMechanicWithSwitch });
   }
 
